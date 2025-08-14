@@ -1,0 +1,79 @@
+// 获取锅炉是否在制备热水
+var boiler_hot_water_status = flow.get("boiler_hot_water_status") || false;
+
+// 从 flow 中获取存储的水箱状态（温度）
+var di_nuan_shui_xiang_state = flow.get("di_nuan_shui_xiang_state");
+
+// 检查是否成功获取到状态
+if (di_nuan_shui_xiang_state === undefined) {
+    // 如果没有获取到状态，设置一个默认值
+    di_nuan_shui_xiang_state = 60;  // 假设默认值为 60°C
+}
+
+// 获取目标温度和当前温度（这可以根据实际的传感器数据来获取）
+var traget_temperature = msg.data.attributes.temperature;  // 假设目标温度来自 msg.data
+var current_temperature = msg.data.attributes.current_temperature;  // 当前温度
+
+// 计算温差
+var D_temperature = traget_temperature - current_temperature;
+msg.D_temperature = D_temperature;
+
+// PID控制参数
+var Kp = 8;  // 比例系数，降低比例系数以适应较慢的阀门响应
+var Ki = 0.05; // 积分系数，适当降低积分系数，以减少长期误差
+var Kd = 0.5; // 微分系数
+
+// 获取之前的积分值和误差
+var integral = flow.get("integral") || 0;
+var previous_error = flow.get("previous_error") || 0;
+
+// 如果锅炉正在加热生活热水，增加比例系数以增加反应速度
+if (boiler_hot_water_status === true) {
+    Kp = Kp * 1.5;  // 增加比例系数，增强响应速度
+}
+
+// 积分饱和限制（防止积分项过度增长）
+var integral_limit = 10;  // 设置积分项的最大限制（可根据需求调整）
+var min_threshold = 0.1; // 小温差阈值，避免温差过小时积分项过度增长
+
+// 防止积分项过度增长：温差小于阈值时，不再增加积分项
+if (Math.abs(D_temperature) > min_threshold) {  
+    integral += D_temperature;
+} else {
+    // 如果温差非常小（接近目标），清空积分项
+    integral = Math.min(Math.max(integral, -integral_limit), integral_limit);  // 限制积分项范围
+}
+
+// 防止积分项过度累积导致阀门开度停留在极限值
+if (Math.abs(integral) >= integral_limit) {
+    integral = integral > 0 ? integral_limit : -integral_limit;  // 限制积分项在正负极限内
+}
+
+var derivative = D_temperature - previous_error;
+var level = Kp * D_temperature + Ki * integral + Kd * derivative;
+
+// 更新之前的积分值和误差
+flow.set("integral", integral);
+flow.set("previous_error", D_temperature);
+
+// 增益调节，根据温差动态调整Kp
+if (Math.abs(D_temperature) < 1) Kp = 5;  // 小温差时减少增益
+else if (Math.abs(D_temperature) > 3) Kp = 12;  // 大温差时增加增益
+
+// 计算新的level值，并限制范围在-4到4之间
+level = Math.min(Math.max(level, -4), 4);
+
+// 阀门调整速度限制
+var max_change = 0.1;  // 每次调整的最大变化量，限制过快调整
+var previous_level = flow.get("previous_level") || 0;
+level = previous_level + max_change * Math.sign(level - previous_level);  // 限制调整速度
+
+// 更新previous_level
+flow.set("previous_level", level);
+
+// 将level值转换为1到4095的范围
+var set_point = Math.round(((level + 4) / 8) * 4094) + 1; // 将-4到4的level映射到1到4095的范围
+
+// 返回设定点
+msg.payload = set_point;
+return msg;
