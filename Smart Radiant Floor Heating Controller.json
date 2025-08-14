@@ -1,0 +1,729 @@
+// 地暖智能控制系统 V24.0
+// 作者：JiangNanGenius
+// 日期：2025-8-15
+// 说明：此代码实现了一个改进的智能地暖控制系统。它根据房间温度需求、室外温度、阳光强度等因素，智能调节混合水温度。
+//      在此版本中，对水箱冷却模型进行了修改，考虑了水箱的自然冷却（6 小时下降 30℃）、热负荷的影响，以及流量变化（根据房间是否达标）。
+//      同时，调整了长期未达标房间的补偿机制，确保补偿值足够，防止输出温度持续下降。
+//
+// **************************************************
+//                    **系统配置参数**
+// **************************************************
+const SYSTEM_CONFIG = {
+    STORAGE_KEY: "fh_v24_final",      // 存储到流程节点的数据键名
+    CONTROL_CYCLE: 10000,             // 控制周期为 10 秒
+    DEBUG_LEVEL: 0,                   // 调试等级：0=无调试，1=核心信息，2=详细调试，3=完整调试（包括房间详情）
+    SAFETY: {                         // 安全配置
+        MAX_TEMP: 61,                 // 安全最高温度（混合水温度不能超过此值）
+        MIN_TEMP: 30,                 // 安全最低温度（混合水温度不能低于此值）
+        HYSTERESIS: 8,                // 调节回差（防止频繁切换锅炉）
+        KP: 1.0,                      // PID 控制器的比例系数
+        KI: 0.05,                     // PID 控制器的积分系数
+        KD: 0.5,                      // PID 控制器的微分系数
+        MAX_STEP: 1.0,                // 单次最大调整温度，防止每次调整过大
+        MAX_INTEGRAL: 10.0,           // 积分项的最大绝对值，防止积分饱和
+    },
+    THERMAL: {                        // 热力学参数
+        HEAT_RATE: 0.18,              // 缓冲器加热速率（℃/秒）
+        BUFFER_CAPACITY: 80,          // 缓冲水箱容量（升）
+        SPECIFIC_HEAT_WATER: 4.186,   // 水的比热容，J/(g·℃)
+        WATER_DENSITY: 1000,          // 水的密度，kg/m³
+        TANK_HEAT_LOSS_RATE: 30 / (6 * 3600), // 水箱自然冷却速率，≈0.0013889 ℃/秒（6 小时降 30℃）
+    },
+    OUTDOOR_TEMP_ADJUSTMENT: {        // 室外温度补偿配置
+        REFERENCE_TEMP: 5,            // 基准室外温度（5℃，低温）
+        SLOPE: 0.3                    // 线性系数，每变化 1℃，输出温度调整 0.3℃
+    },
+    SUNLIGHT_ADJUSTMENT: {            // 阳光强度补偿配置
+        REFERENCE_LUX: 1000,          // 基准阳光强度（1000 Lux）
+        SLOPE: -1.0 / 50000,          // 线性系数，阳光强度每增加 50000 Lux，输出温度减少 1℃
+        MAX_ADJUSTMENT: -2.0          // 最大调整幅度（-2℃）
+    },
+    WATER_TEMPERATURE: {              // 水温相关的变量名配置
+        RETURN_TEMPERATURE_KEY: "floorheating_returnwater_temperature_state", // 回水温度变量名
+        MIXED_TEMPERATURE_KEY: "floorheating_mixedwater_temperature_state",    // 混合水温度变量名
+        OUTPUT_TEMPERATURE_KEY: "floorheating_outputwater_temperature_state",  // 出水温度变量名
+    },
+    ROOM_CONFIG: {                    // 房间未达标处理配置
+        MAX_UNDERHEAT_DURATION: 900, // 房间允许的最长未达标时间，单位秒，例如 1800 秒 = 30 分钟
+        WEIGHT_INCREMENT: 2.0,        // 当未达标时间超过阈值时，增加的权重值（增大以加强补偿效果）
+        COMPENSATION_INCREMENT: 1.0,  // 每经过一个周期的未达标房间，增加的输出温度补偿（℃）
+        MAX_COMPENSATION: 5.0         // 未达标补偿的最大值（℃），防止过度补偿
+    }
+};
+// **************************************************
+//                    **系统状态初始化**
+// **************************************************
+/**
+ * 初始化系统状态
+ * 从流程存储中读取状态，如果不存在或无效，则初始化默认状态。
+ */
+let state = (function initState() {
+    // 从流程存储中读取状态
+    const stored = flow.get(SYSTEM_CONFIG.STORAGE_KEY);
+    // 检查存储的状态是否完整且有效
+    const isValid = stored !== undefined &&
+        typeof stored?.sys?.enabled === 'boolean' &&
+        typeof stored?.ctrl?.output === 'number' &&
+        typeof stored?.thermal?.watertank === 'number';
+    // 定义系统默认状态
+    const defaults = Object.freeze({
+        sys: {
+            enabled: false,              // 系统是否启用
+            boilerMode: "init",          // 锅炉当前模式（init, buffer_heat, cooling, domestic）
+            boilerBurning: false,        // 锅炉是否在燃烧
+            boilerFloorHeating: false,   // 锅炉是否在加热地暖
+            lastBoilerBurning: false,    // 上一次锅炉燃烧状态
+            lastBoilerFloorHeating: false, // 上一次锅炉地暖加热状态
+            lastError: 0.0               // 上一次误差（用于 PID 微分项）
+        },
+        ctrl: {
+            output: 38.0,                // 混合水温度目标值，初始为 38℃
+            outputRaw: 38.0,             // 混合水温度的实际计算值（浮点数）
+            integral: 0.0,               // PID 控制器的积分项，初始为 0
+            lastUpdate: Date.now()       // 上次更新时间
+        },
+        thermal: {
+            watertank: 55.0,             // 地暖水箱温度，初始为 55℃
+            outdoor: 10.0                // 室外温度，初始为 10℃
+        },
+        sensors: {
+            sunlight: 500,               // 阳光强度（Lux），初始为 500 Lux
+            returnWaterTemp: 30,         // 回水温度，初始为 30℃
+            mixedWaterTemp: 35.0,        // 混合水温度，初始为 35.0℃
+            outputWaterTemp: 35          // 出水温度，初始为 35℃
+        },
+        roomStates: {}                   // 保存各个房间的状态信息（例如未达标时间、补偿值等）
+    });
+    if (isValid) {
+        // 合并存储数据和默认数据
+        const merged = {
+            sys: { ...defaults.sys, ...stored.sys },
+            ctrl: { ...defaults.ctrl, ...stored.ctrl },
+            thermal: { ...defaults.thermal, ...stored.thermal },
+            sensors: { ...defaults.sensors, ...stored.sensors },
+            roomStates: { ...defaults.roomStates, ...stored.roomStates }
+        };
+        // 修复类型和精度问题
+        merged.ctrl.output = parseFloat(merged.ctrl.output.toFixed(1));
+        merged.thermal.watertank = parseFloat(merged.thermal.watertank.toFixed(1));
+        merged.sensors.mixedWaterTemp = parseFloat(merged.sensors.mixedWaterTemp.toFixed(1));
+        // 输出调试信息
+        if (SYSTEM_CONFIG.DEBUG_LEVEL >= 1) {
+            node.warn(`[存储] 成功加载 地暖水箱温度=${merged.thermal.watertank}℃，输出温度=${merged.ctrl.output}℃`);
+        }
+        return merged;
+    } else {
+        // 如果无效，使用默认状态初始化
+        const freshState = JSON.parse(JSON.stringify(defaults));
+        flow.set(SYSTEM_CONFIG.STORAGE_KEY, freshState);
+        // 输出调试信息
+        if (SYSTEM_CONFIG.DEBUG_LEVEL >= 1) {
+            node.warn("[存储] 初始化全新状态，并已保存到存储");
+        }
+        return freshState;
+    }
+})();
+// **************************************************
+//                    **主控制流程**
+// **************************************************
+/**
+ * 主控制逻辑
+ * 根据触发来源（msg.payload），决定如何处理。
+ */
+try {
+    // 首先，检查触发来源
+    // 如果没有收到 msg.payload，默认认为是定时器触发
+    const trigger = msg.payload || "timer";
+    // 更新关键传感器数据和锅炉状态，无论是什么触发，都需要更新状态
+    updateCriticalSensors();
+    // 记录上一次的锅炉燃烧状态和地暖加热状态
+    const lastBoilerBurning = state.sys.boilerBurning;
+    const lastBoilerFloorHeating = state.sys.boilerFloorHeating;
+    // 更新锅炉状态和模式
+    updateBoilerState();
+    // 检查锅炉模式是否发生变化
+    if (state.sys.boilerMode !== state.sys.lastBoilerMode) {
+        logStateTransition(state.sys.lastBoilerMode, state.sys.boilerMode);
+        state.sys.lastBoilerMode = state.sys.boilerMode;
+    }
+    // 无论何种触发方式，都需要保存状态
+    flow.set(SYSTEM_CONFIG.STORAGE_KEY, state);
+    // 只有在定时器触发或条件变化触发时，才执行控制算法，防止过度频繁的调整
+    if (trigger === "timer" || trigger === "condition") {
+        // 检查系统是否启用
+        state.sys.enabled = checkSystemEnabled();
+        if (!state.sys.enabled) {
+            // 如果系统关闭，设置输出为最低温度，直接返回
+            msg.payload = SYSTEM_CONFIG.SAFETY.MIN_TEMP.toString();
+            if (SYSTEM_CONFIG.DEBUG_LEVEL >= 1) {
+                debugLog("系统关闭");
+            }
+            return msg;
+        }
+        const currentTime = Date.now(); // 当前时间戳
+        // 获取温度误差
+        const temperatureError = calculateTemperatureError(currentTime);
+        // 计算 PID 调整量
+        const adjustment = computePIDAdjustment(temperatureError);
+        // 应用温度调整
+        applyTemperatureAdjustment(adjustment);
+        // 考虑外部因素进行补偿
+        applyExternalFactorsCompensation();
+        // 根据热能供给场景，调整输出补偿
+        applyHeatSupplyCompensation();
+        // 考虑未达标房间的补偿
+        applyUnderheatCompensation();
+        // 更新地暖水箱温度
+        updateWatertankTemperature(currentTime);
+        // 根据水温传感器判断热负荷，调整系统响应
+        adjustForThermalLoad();
+        // 输出调试信息
+        if (SYSTEM_CONFIG.DEBUG_LEVEL >= 1) {
+            generateDebugOutput({
+                adjustment,
+                temperatureError
+            });
+        }
+        // 保存更新后的状态
+        flow.set(SYSTEM_CONFIG.STORAGE_KEY, state);
+        // 输出混合水温度目标值（取整）
+        msg.payload = state.ctrl.output.toFixed(0);
+        return msg;
+    } else {
+        // 非定时器触发（如锅炉状态变化），仅更新状态，不执行控制算法
+        // 状态已在上面保存
+        // 不需要返回信息
+        return null;
+    }
+} catch (err) {
+    // 处理致命错误
+    handleFatalError(err);
+    // 输出最低温度，进入安全模式
+    msg.payload = SYSTEM_CONFIG.SAFETY.MIN_TEMP.toString();
+    return msg;
+}
+// **************************************************
+//                    **核心函数**
+// **************************************************
+/**
+ * 检查系统是否启用
+ * @returns {boolean}
+ */
+function checkSystemEnabled() {
+    const rawVal = flow.get("floorheating_state");
+    return ["on", "true", "1", "enable", "heat"].includes(String(rawVal).toLowerCase().trim());
+}
+/**
+ * 更新关键传感器数据
+ * 包括锅炉状态、温度传感器、阳光强度等
+ */
+function updateCriticalSensors() {
+    // 更新锅炉燃烧状态
+    const boilerStatusRaw = flow.get("boiler_burning_status");
+    if (boilerStatusRaw === undefined) {
+        node.warn("无法获取锅炉燃烧状态，使用默认值 false");
+        state.sys.boilerBurning = false;
+    } else {
+        state.sys.boilerBurning = ["on", "true", "1"].includes(
+            String(boilerStatusRaw).toLowerCase().trim()
+        );
+    }
+    // 更新锅炉地暖加热状态
+    const boilerFloorHeatingRaw = flow.get("boiler_floorheating_status");
+    if (boilerFloorHeatingRaw === undefined) {
+        node.warn("无法获取锅炉地暖加热状态，使用默认值 false");
+        state.sys.boilerFloorHeating = false;
+    } else {
+        state.sys.boilerFloorHeating = ["on", "true", "1"].includes(
+            String(boilerFloorHeatingRaw).toLowerCase().trim()
+        );
+    }
+    // 更新室外温度
+    const outsideTempRaw = flow.get("outside_temperature_state");
+    if (outsideTempRaw === undefined) {
+        node.warn(`无法获取室外温度，使用上一次值 ${state.thermal.outdoor}℃`);
+    }
+    const newOutdoor = parseFloat(outsideTempRaw) || state.thermal.outdoor;
+    state.thermal.outdoor = clamp(newOutdoor, -30, 50);
+    // 更新地暖水箱温度
+    const watertankTempRaw = flow.get("floorheating_watertank");
+    if (watertankTempRaw === undefined) {
+        node.warn(`无法获取地暖水箱温度，使用上一次值 ${state.thermal.watertank}℃`);
+    }
+    const newWatertankTemp = parseFloat(watertankTempRaw) || state.thermal.watertank;
+    state.thermal.watertank = clamp(newWatertankTemp, 10, 80);
+    // 更新阳光传感器数据
+    const sunlightRaw = flow.get("floorheating_sunlight");
+    if (sunlightRaw === undefined) {
+        node.warn(`无法获取阳光强度，使用上一次值 ${state.sensors.sunlight} Lux`);
+    }
+    state.sensors.sunlight = parseFloat(sunlightRaw) || state.sensors.sunlight;
+    // 更新回水温度
+    const returnWaterTempRaw = flow.get(SYSTEM_CONFIG.WATER_TEMPERATURE.RETURN_TEMPERATURE_KEY);
+    if (returnWaterTempRaw === undefined) {
+        node.warn(`无法获取回水温度，使用上一次值 ${state.sensors.returnWaterTemp}℃`);
+    }
+    state.sensors.returnWaterTemp = parseInt(returnWaterTempRaw) || state.sensors.returnWaterTemp;
+    // 更新混合水温度
+    const mixedWaterTempRaw = flow.get(SYSTEM_CONFIG.WATER_TEMPERATURE.MIXED_TEMPERATURE_KEY);
+    if (mixedWaterTempRaw === undefined) {
+        node.warn(`无法获取混合水温度，使用上一次值 ${state.sensors.mixedWaterTemp}℃`);
+    }
+    state.sensors.mixedWaterTemp = parseFloat(mixedWaterTempRaw) || state.sensors.mixedWaterTemp;
+    // 更新出水温度
+    const outputWaterTempRaw = flow.get(SYSTEM_CONFIG.WATER_TEMPERATURE.OUTPUT_TEMPERATURE_KEY);
+    if (outputWaterTempRaw === undefined) {
+        node.warn(`无法获取出水温度，使用上一次值 ${state.sensors.outputWaterTemp}℃`);
+    }
+    state.sensors.outputWaterTemp = parseInt(outputWaterTempRaw) || state.sensors.outputWaterTemp;
+}
+/**
+ * 更新锅炉状态和模式
+ * 根据锅炉燃烧状态和地暖加热状态，判断锅炉当前的工作模式
+ */
+function updateBoilerState() {
+    // 记住上一次的锅炉燃烧状态和地暖加热状态
+    const lastBoilerBurning = state.sys.lastBoilerBurning;
+    const lastBoilerFloorHeating = state.sys.lastBoilerFloorHeating;
+    // 判断锅炉模式
+    if (state.sys.boilerBurning) {
+        if (state.sys.boilerFloorHeating) {
+            // 燃烧器打开，正在加热地暖
+            state.sys.boilerMode = "buffer_heat"; // 全功率供热期
+        } else {
+            // 燃烧器打开，但没有加热地暖，说明在加热生活热水
+            state.sys.boilerMode = "domestic"; // 生活热水模式
+        }
+    } else {
+        if (lastBoilerBurning && lastBoilerFloorHeating) {
+            // 刚刚停止加热地暖，进入余热供给期
+            state.sys.boilerMode = "cooling"; // 余热供给期
+        } else {
+            // 默认进入冷却模式
+            state.sys.boilerMode = "cooling";
+        }
+    }
+    // 更新上一次的锅炉燃烧状态和地暖加热状态
+    state.sys.lastBoilerBurning = state.sys.boilerBurning;
+    state.sys.lastBoilerFloorHeating = state.sys.boilerFloorHeating;
+}
+/**
+ * 计算房间温度误差，得出平均误差
+ * 引入未达标时间的判断，增加未达标房间的权重或添加补偿
+ * @param {number} currentTime - 当前时间戳（毫秒）
+ * @returns {number} - 平均温度误差
+ */
+function calculateTemperatureError(currentTime) {
+    let totalWeight = 0;
+    let totalError = 0;
+    // 定义房间列表
+    const roomList = [
+        { id: "can_ting", isLiving: true },
+        { id: "ke_ting", isLiving: true },
+        { id: "wo_shi_1", isLiving: false },
+        { id: "wo_shi_2", isLiving: false },
+        { id: "wo_shi_3", isLiving: false },
+        { id: "shu_fang", isLiving: false },
+        { id: "zhu_wo", isLiving: false }
+    ];
+    roomList.forEach(room => {
+        const active = isRoomActive(room.id);
+        if (!active) return; // 房间未开启地暖，跳过
+        const currentTemp = getRoomCurrentTemp(room.id);
+        const targetTemp = getRoomTargetTemp(room.id);
+        const tempDifference = targetTemp - currentTemp;
+        // 初始化房间状态，如果不存在
+        if (!state.roomStates[room.id]) {
+            state.roomStates[room.id] = {
+                underheatDuration: 0, // 未达标持续时间（秒）
+                lastUnderheatCheck: currentTime, // 上次检查时间戳
+                compensation: 0      // 未达标补偿值
+            };
+        }
+        const roomState = state.roomStates[room.id];
+        // 计算时间差（秒）
+        const timeDiff = (currentTime - roomState.lastUnderheatCheck) / 1000;
+        // 更新上次检查时间
+        roomState.lastUnderheatCheck = currentTime;
+        // 检查房间是否达标
+        if (currentTemp < targetTemp) {
+            // 房间未达标，累积未达标时间
+            roomState.underheatDuration += timeDiff;
+            // 增加未达标补偿值
+            roomState.compensation += SYSTEM_CONFIG.ROOM_CONFIG.COMPENSATION_INCREMENT;
+            // 限制补偿值
+            roomState.compensation = clamp(
+                roomState.compensation,
+                0,
+                SYSTEM_CONFIG.ROOM_CONFIG.MAX_COMPENSATION
+            );
+        } else {
+            // 房间已达标，重置未达标时间和补偿值
+            roomState.underheatDuration = 0;
+            roomState.compensation = 0;
+        }
+        // 计算权重，基础权重 + 温差权重
+        let weight = (room.isLiving ? 1.8 : 1.0) + Math.abs(tempDifference) * 1.0;
+        // 如果房间未达标时间超过阈值，增加额外权重
+        if (roomState.underheatDuration >= SYSTEM_CONFIG.ROOM_CONFIG.MAX_UNDERHEAT_DURATION) {
+            weight += SYSTEM_CONFIG.ROOM_CONFIG.WEIGHT_INCREMENT;
+            // 输出调试信息
+            if (SYSTEM_CONFIG.DEBUG_LEVEL >= 2) {
+                debugLog(`房间 ${room.id} 未达标时间超过阈值，增加权重到 ${weight.toFixed(2)}`);
+            }
+        }
+        totalWeight += weight;
+        totalError += tempDifference * weight;
+    });
+    if (totalWeight === 0) {
+        return 0; // 无激活房间，无需调整
+    }
+    // 计算加权平均温度误差
+    return totalError / totalWeight;
+}
+/**
+ * 计算 PID 调整量
+ * @param {number} error - 温度误差
+ * @returns {number} - 调整量
+ */
+function computePIDAdjustment(error) {
+    const derivative = error - state.sys.lastError;
+    state.sys.lastError = error;
+    state.ctrl.integral += error * SYSTEM_CONFIG.SAFETY.KI;
+    // 限制积分项，防止积分饱和
+    state.ctrl.integral = clamp(
+        state.ctrl.integral,
+        -SYSTEM_CONFIG.SAFETY.MAX_INTEGRAL,
+        SYSTEM_CONFIG.SAFETY.MAX_INTEGRAL
+    );
+    const adjustment = error * SYSTEM_CONFIG.SAFETY.KP +
+        state.ctrl.integral +
+        derivative * SYSTEM_CONFIG.SAFETY.KD;
+    // 限制调整量，防止过调节
+    return clamp(
+        adjustment,
+        -SYSTEM_CONFIG.SAFETY.MAX_STEP,
+        SYSTEM_CONFIG.SAFETY.MAX_STEP
+    );
+}
+/**
+ * 应用温度调整，更新输出目标温度
+ * @param {number} adjustment
+ */
+function applyTemperatureAdjustment(adjustment) {
+    state.ctrl.outputRaw += adjustment;
+    // 确保调整后的温度在安全范围内
+    state.ctrl.outputRaw = clamp(
+        state.ctrl.outputRaw,
+        SYSTEM_CONFIG.SAFETY.MIN_TEMP,
+        SYSTEM_CONFIG.SAFETY.MAX_TEMP
+    );
+    // 取整作为实际输出
+    state.ctrl.output = Math.round(state.ctrl.outputRaw);
+}
+/**
+ * 考虑外部因素（室外温度和阳光强度）进行补偿
+ */
+function applyExternalFactorsCompensation() {
+    // 考虑室外温度的负向补偿（室外温度越低，混合水温度越高）
+    const outdoorTempDifference = SYSTEM_CONFIG.OUTDOOR_TEMP_ADJUSTMENT.REFERENCE_TEMP - state.thermal.outdoor;
+    const outdoorAdjustment = outdoorTempDifference * SYSTEM_CONFIG.OUTDOOR_TEMP_ADJUSTMENT.SLOPE;
+    state.ctrl.output += outdoorAdjustment;
+    // 考虑阳光强度的负向补偿
+    const sunlightDifference = state.sensors.sunlight - SYSTEM_CONFIG.SUNLIGHT_ADJUSTMENT.REFERENCE_LUX;
+    let sunlightAdjustment = sunlightDifference * SYSTEM_CONFIG.SUNLIGHT_ADJUSTMENT.SLOPE;
+    // 限制阳光补偿的最大调整幅度
+    if (sunlightAdjustment < SYSTEM_CONFIG.SUNLIGHT_ADJUSTMENT.MAX_ADJUSTMENT) {
+        sunlightAdjustment = SYSTEM_CONFIG.SUNLIGHT_ADJUSTMENT.MAX_ADJUSTMENT;
+    }
+    state.ctrl.output += sunlightAdjustment;
+    // 确保最终输出温度在安全范围内
+    state.ctrl.output = clamp(
+        state.ctrl.output,
+        SYSTEM_CONFIG.SAFETY.MIN_TEMP,
+        SYSTEM_CONFIG.SAFETY.MAX_TEMP
+    );
+}
+/**
+ * 应用未达标房间的温度补偿
+ * 将未达标房间的补偿值累加到输出温度
+ */
+function applyUnderheatCompensation() {
+    let totalCompensation = 0;
+    for (const roomId in state.roomStates) {
+        const roomState = state.roomStates[roomId];
+        totalCompensation = Math.max(totalCompensation, roomState.compensation);
+    }
+    if (totalCompensation > 0) {
+        state.ctrl.output += totalCompensation;
+        // 确保输出温度在安全范围内
+        state.ctrl.output = clamp(
+            state.ctrl.output,
+            SYSTEM_CONFIG.SAFETY.MIN_TEMP,
+            SYSTEM_CONFIG.SAFETY.MAX_TEMP
+        );
+        // 输出调试信息
+        if (SYSTEM_CONFIG.DEBUG_LEVEL >= 2) {
+            debugLog(`应用未达标房间补偿，总补偿值：${totalCompensation.toFixed(2)}℃`);
+        }
+    }
+}
+/**
+ * 根据热能供给场景，调整输出温度补偿
+ */
+function applyHeatSupplyCompensation() {
+    switch (state.sys.boilerMode) {
+        case "buffer_heat":
+            // 全功率供热期，保持输出温度不变
+            break;
+        case "cooling":
+            // 余热供给期，适当降低输出温度，防止过热
+            state.ctrl.output -= 1; // 减少 1℃
+            break;
+        case "domestic":
+            // 生活热水模式，降低温度以节省系统余热
+            state.ctrl.output -= 2; // 减少 2℃
+            break;
+    }
+    // 确保最终输出温度在安全范围内
+    state.ctrl.output = clamp(
+        state.ctrl.output,
+        SYSTEM_CONFIG.SAFETY.MIN_TEMP,
+        SYSTEM_CONFIG.SAFETY.MAX_TEMP
+    );
+}
+/**
+ * 更新地暖水箱温度
+ * 修改冷却模型，考虑热负荷和水箱自然冷却
+ * @param {number} currentTime - 当前时间戳（毫秒）
+ */
+function updateWatertankTemperature(currentTime) {
+    const interval = (currentTime - state.ctrl.lastUpdate) / 1000; // 时间差（秒）
+    state.ctrl.lastUpdate = currentTime; // 更新最近更新时间
+    const tankVolume = SYSTEM_CONFIG.THERMAL.BUFFER_CAPACITY; // 水箱容量（升）
+    const specificHeat = SYSTEM_CONFIG.THERMAL.SPECIFIC_HEAT_WATER; // 水的比热容，J/(g·℃)
+    const waterDensity = SYSTEM_CONFIG.THERMAL.WATER_DENSITY; // 水的密度，kg/m³
+    const mass = tankVolume * waterDensity; // 水的质量，kg
+    // 计算热负荷（供热输出）
+    const heatDemand = calculateHeatDemand(interval); // 单位时间内需要的热量，单位焦耳（J）
+    // 计算水箱温度变化
+    let deltaTemp = 0;
+    switch (state.sys.boilerMode) {
+        case "buffer_heat":
+            // 加热模式，缓冲水箱温度上升
+            deltaTemp = SYSTEM_CONFIG.THERMAL.HEAT_RATE * interval;
+            break;
+        default:
+            // 冷却模式，缓冲水箱温度下降
+            // 计算水箱自然冷却的温度下降
+            const naturalCooling = SYSTEM_CONFIG.THERMAL.TANK_HEAT_LOSS_RATE * interval;
+            // 计算由于热负荷导致的温度下降
+            const heatLossTemp = heatDemand / (mass * specificHeat * 1000); // 乘以1000将比热容单位转换为 J/(kg·℃)
+            // 总温度变化
+            deltaTemp = -(naturalCooling + heatLossTemp);
+            break;
+    }
+    // 更新水箱温度
+    state.thermal.watertank += deltaTemp;
+    // 限制水箱温度范围
+    state.thermal.watertank = parseFloat(clamp(state.thermal.watertank, 10, 80).toFixed(1));
+}
+/**
+ * 计算热负荷（单位时间内的热量需求）
+ * @param {number} interval - 时间间隔（秒）
+ * @returns {number} - 热负荷，单位焦耳（J）
+ */
+function calculateHeatDemand(interval) {
+    // 获取混合水温度和回水温度
+    const mixedWaterTemp = state.sensors.mixedWaterTemp; // 混合水温度，℃
+    const returnWaterTemp = state.sensors.returnWaterTemp; // 回水温度，℃
+    // 估计实际开启的房间数量
+    const activeRooms = getActiveRooms();
+    // 估计总的热负荷占比，根据未达标房间数量估算
+    const totalRooms = 7; // 总房间数
+    const activeRoomCount = activeRooms.length; // 当前开启的房间数
+    // 估算流量（kg/s），根据泵的额定流量和房间开启状态调整
+    let flowRate = estimateFlowRate(activeRoomCount, totalRooms); // kg/s
+    // 计算热负荷 Q = m * c * ΔT
+    const massFlow = flowRate; // 质量流量，kg/s
+    const specificHeat = SYSTEM_CONFIG.THERMAL.SPECIFIC_HEAT_WATER; // 水的比热容，J/(g·℃)
+    const deltaTemp = mixedWaterTemp - returnWaterTemp; // 温差，℃
+    const heatDemand = massFlow * specificHeat * 1000 * deltaTemp * interval; // 单位时间内的热量，J
+    return heatDemand;
+}
+/**
+ * 估计水流量
+ * @param {number} activeRoomCount - 当前开启的房间数量
+ * @param {number} totalRooms - 总房间数
+ * @returns {number} - 水流量，单位 kg/s
+ */
+function estimateFlowRate(activeRoomCount, totalRooms) {
+    // 泵的额定流量：13 L/min，转换为 kg/s
+    const ratedFlowRate = 13 / 60 * 1.0; // kg/s（假设水的密度为 1 kg/L）
+    // 考虑到当房间温度达到目标后，阀门半开合，流量会下降 30%
+    const flowRateReduction = 0.7; // 流量下降系数（30%）
+    // 计算实际的流量比例
+    const flowRatio = activeRoomCount / totalRooms;
+    // 计算实际流量
+    const actualFlowRate = ratedFlowRate * (flowRatio * flowRateReduction + (1 - flowRatio));
+    return actualFlowRate;
+}
+/**
+ * 获取当前开启的房间列表
+ * @returns {string[]} - 开启的房间 ID 列表
+ */
+function getActiveRooms() {
+    const rooms = [
+        "can_ting", "ke_ting", "wo_shi_1", "wo_shi_2",
+        "wo_shi_3", "shu_fang", "zhu_wo"
+    ];
+    return rooms.filter(id => isRoomActive(id));
+}
+/**
+ * 根据水温传感器判断热负荷，调整系统响应
+ */
+function adjustForThermalLoad() {
+    const { returnWaterTemp, mixedWaterTemp, outputWaterTemp } = state.sensors;
+    // 计算供回水温差
+    const deltaReturnMixed = mixedWaterTemp - returnWaterTemp;
+    // 根据供回水温差调整输出温度
+    if (deltaReturnMixed < 5) {
+        // 供回水温差过小，可能热负荷不足，适当增加混合水温度
+        state.ctrl.output += 1;
+    } else if (deltaReturnMixed > 10) {
+        // 供回水温差过大，可能室内过热，适当降低混合水温度
+        state.ctrl.output -= 1;
+    }
+    // 确保输出温度在安全范围内
+    state.ctrl.output = clamp(
+        state.ctrl.output,
+        SYSTEM_CONFIG.SAFETY.MIN_TEMP,
+        SYSTEM_CONFIG.SAFETY.MAX_TEMP
+    );
+}
+/**
+ * 生成调试输出信息
+ * @param {Object} ctx - 上下文信息
+ */
+function generateDebugOutput(ctx) {
+    const { adjustment, temperatureError } = ctx;
+    const lines = [
+        `==== 系统报告 [${new Date().toLocaleTimeString()}] ====`,
+        `触发方式: ${msg.payload || "timer"}`,
+        `当前模式: ${state.sys.boilerMode.padEnd(10)} 燃烧器: ${state.sys.boilerBurning ? '工作' : '停止'} 地暖加热: ${state.sys.boilerFloorHeating ? '是' : '否'}`,
+        `水箱温度: ${state.thermal.watertank.toFixed(1)}℃ 室外温度: ${state.thermal.outdoor.toFixed(1)}℃`,
+        `阳光强度: ${state.sensors.sunlight.toFixed(0)} Lux`,
+        `回水温度: ${state.sensors.returnWaterTemp}℃ 混合水温度: ${state.sensors.mixedWaterTemp.toFixed(1)}℃ 出水温度: ${state.sensors.outputWaterTemp}℃`,
+        `温度误差: ${temperatureError.toFixed(2)}℃`
+    ];
+    if (SYSTEM_CONFIG.DEBUG_LEVEL >= 2) {
+        lines.push(
+            `调整量: ${adjustment.toFixed(3)}℃ 积分项: ${state.ctrl.integral.toFixed(2)}`,
+            `输出浮点值: ${state.ctrl.outputRaw.toFixed(3)} 上次误差: ${state.sys.lastError.toFixed(2)}`
+        );
+        // 输出未达标房间的补偿值
+        const totalCompensation = Math.max(...Object.values(state.roomStates).map(rs => rs.compensation || 0));
+        lines.push(`未达标房间总补偿值: ${totalCompensation.toFixed(2)}℃`);
+    }
+    if (SYSTEM_CONFIG.DEBUG_LEVEL >= 3) {
+        lines.push("激活房间详情:");
+        lines.push(...getActiveRoomDetails());
+        // 输出房间未达标时间和补偿值
+        lines.push("房间未达标时间和补偿详情:");
+        for (const roomId in state.roomStates) {
+            const roomState = state.roomStates[roomId];
+            lines.push(`${roomId}: 未达标时间 ${roomState.underheatDuration.toFixed(0)} 秒, 补偿值 ${roomState.compensation.toFixed(2)}℃`);
+        }
+    }
+    node.warn(lines.join('\n'));
+}
+/**
+ * 记录状态切换
+ * @param {string} from - 上一个模式
+ * @param {string} to - 当前模式
+ */
+function logStateTransition(from, to) {
+    if (SYSTEM_CONFIG.DEBUG_LEVEL >= 1) {
+        node.warn(`[状态切换] ${from} → ${to}`);
+    }
+}
+// **************************************************
+//                    **工具函数**
+// **************************************************
+/**
+ * 判断房间是否开启地暖
+ * @param {string} roomId
+ * @returns {boolean}
+ */
+function isRoomActive(roomId) {
+    const raw = flow.get(`floorheating_${roomId}_di_nuan_state`);
+    return ["on", "heat", "true", "1"].includes(String(raw).toLowerCase().trim());
+}
+/**
+ * 获取房间当前温度
+ * @param {string} roomId
+ * @returns {number}
+ */
+function getRoomCurrentTemp(roomId) {
+    const raw = flow.get(`floorheating_${roomId}_di_nuan_current_temp`);
+    return clamp(Number(raw) || state.thermal.outdoor, 10, 40);
+}
+/**
+ * 获取房间目标温度
+ * @param {string} roomId
+ * @returns {number}
+ */
+function getRoomTargetTemp(roomId) {
+    const raw = flow.get(`floorheating_${roomId}_di_nuan_target_temp`);
+    return clamp(Number(raw) || 20, 16, 35);
+}
+/**
+ * 获取激活房间的详情
+ * @returns {string[]}
+ */
+function getActiveRoomDetails() {
+    const rooms = [
+        "can_ting", "ke_ting", "wo_shi_1", "wo_shi_2",
+        "wo_shi_3", "shu_fang", "zhu_wo"
+    ];
+    return rooms
+        .map(id => {
+            const active = isRoomActive(id);
+            if (!active) return null;
+            const current = getRoomCurrentTemp(id);
+            const target = getRoomTargetTemp(id);
+            return `${id}: 当前 ${current}℃ / 目标 ${target}℃`;
+        })
+        .filter(Boolean);
+}
+/**
+ * 限制数值范围
+ * @param {number} val - 输入值
+ * @param {number} min - 最小值
+ * @param {number} max - 最大值
+ * @returns {number}
+ */
+function clamp(val, min, max) {
+    return isNaN(val) ? min : Math.min(Math.max(val, min), max);
+}
+/**
+ * 调试日志记录
+ * @param {string} msg
+ */
+function debugLog(msg) {
+    if (SYSTEM_CONFIG.DEBUG_LEVEL > 0) {
+        node.warn(`[DEBUG] ${msg}`);
+    }
+}
+/**
+ * 处理致命错误
+ * @param {Error} err
+ */
+function handleFatalError(err) {
+    node.error(`[FATAL] ${err.message}`);
+    state.ctrl.output = SYSTEM_CONFIG.SAFETY.MIN_TEMP;
+    state.ctrl.outputRaw = SYSTEM_CONFIG.SAFETY.MIN_TEMP;
+    state.thermal.watertank = 30;
+    node.warn("[安全模式] 系统已重置为最低温度");
+}
+// 脚本结束
