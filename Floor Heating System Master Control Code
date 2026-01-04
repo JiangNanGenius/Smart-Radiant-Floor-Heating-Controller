@@ -1,0 +1,997 @@
+// ============================================================
+// 地暖综合控制主代码 v25.5 (FINAL + 注释补全版 + 锅炉状态status)
+// timer = 5秒
+// Outputs = 7
+//
+// 1) 目标温度显示（整数，仅前端显示） msg.payload="44"
+// 2) 阀门开度（1~4095） msg.payload=1920
+// 3) WS同步/恢复：正常=JSON字符串快照；无本地数据=先发"recover"(最多2次)
+// 4) 锅炉地暖命令：msg.payload="heat"/"off"（用于反复下发给锅炉）
+// 5) 强制开关回弹：enforce按下后自动关（给 HA action 节点）
+// 6) 物理供水温控器模式：msg.topic + msg.payload(heat/off)
+// 7) 严重系统故障报警（微信推送）：msg.title(简要) + msg.payload(详细多行)
+//
+// 传感器分辨率（已确认）
+// - floorheating_mixedwater_temperature_state : 0.1℃（混水，控制主反馈）
+// - floorheating_watertank                   : 0.1℃（水箱温度）
+// - outside_temperature_state                : 0.1℃（户外温度）
+// - floorheating_outputwater_temperature_state: 1℃（地暖出水）
+// - floorheating_returnwater_temperature_state: 1℃（地暖回水）
+// - floorheating_waterflow_state             : 0.001 m³/h（地暖总流量）
+// - 房间 current/target                       : 1℃（整度）；房间模式无 auto，仅 heat/off
+//
+// 阀门：40~50秒全行程；系统关闭时输出 4095（快开+排气策略）
+// ============================================================
+
+
+// ------------------------------------------------------------------------
+// 【报警配置（微信推送）】
+// - msg.title  = “故障简要描述”
+// - msg.payload= “详细内容（多行）”
+// - SAME_CODE_DEDUP_MS：同一类报警在多少时间内只发一次（防刷屏）
+// ------------------------------------------------------------------------
+const ALARM_CONFIG = {
+    HOST: "",                                // 留空：不显示“位置：xxx”
+    SAME_CODE_DEDUP_MS: 3 * 60 * 60 * 1000   // 3小时内相同报警 code 只发一次
+};
+
+
+// ------------------------------------------------------------------------
+// 【WS Recover（复用 Output3）】
+// 背景：Node-RED 重启/部署后，本机 flow 的 state 会丢失；
+// - 如果本机 STORAGE_KEY 没数据：Output3 先发 "recover" 请求（最多2次）
+// - 下一轮 timer 再读取 STORAGE_KEY（由“恢复写回节点”写入）
+// - READY_FLAG_KEY 由“恢复写回节点”置 true，表示恢复完成
+// ------------------------------------------------------------------------
+const RECOVER_CONFIG = {
+    ENABLED: true,
+    STORAGE_KEY: "fh_v24_final",
+    READY_FLAG_KEY: "fh_remote_state_ready",
+    CTX_KEY: "fh_recover_ctrl",
+    APPLIED_KEY: "fh_recover_applied",
+    MAX_ATTEMPTS: 2
+};
+
+
+// ------------------------------------------------------------------------
+// 【启停规则】
+// - 打开：任意分水器开 && 户外<16
+// - 关闭：所有分水器关 && 户外>16
+// - 应急：强制开关按下 && 任意分水器开 => 开一次，并自动回弹关掉
+// ------------------------------------------------------------------------
+const CONTROL_RULE = {
+    OUTDOOR_THRESHOLD_C: 16,
+    ENFORCE_FLOW_KEY: "floorheating_state_enforce"
+};
+
+
+// ------------------------------------------------------------------------
+// 【系统级健康监控】
+// 只监控“地暖系统本体异常”，避免关机流量归零误判。
+// ------------------------------------------------------------------------
+const HEALTH = {
+    STARTUP_GRACE_S: 180,
+    DEMAND_ERR_C: 1.5,
+
+    FLOW_LOW_M3H: 0.05,
+    FLOW_OK_M3H: 0.10,
+    FLOW_STRONG_M3H: 0.15,
+
+    FLOW0_HOLD_S: 120,
+    MIX_STALE_HOLD_S: 600,
+    NO_RISE_HOLD_S: 600,
+    NO_RISE_DELTA_C: 0.2,
+
+    VALVE_OPEN_SP: 2600,
+    TANK_HOT_MARGIN_C: 2.0
+};
+
+
+// ------------------------------------------------------------------------
+// 【系统核心参数】
+// 目标温度平滑 / 功率 / ΔT 估算范围等
+// ------------------------------------------------------------------------
+const SYSTEM = {
+    STORAGE_KEY: RECOVER_CONFIG.STORAGE_KEY,
+
+    MIN_TEMP: 30,
+    MAX_TEMP: 61,
+
+    TICK_S: 5,
+    TARGET_TAU_S: 20,
+    TARGET_MAX_STEP_PER_TICK_C: 0.35,
+
+    HEAT: {
+        NOFLOW_M3H: 0.05,
+        DT_MIN_C: 3.5,
+        DT_MAX_C: 12.0,
+        DT_DEADBAND_C: 0.3,
+        P_EMA_TAU_S: 150,
+        OBS_MAX_KW: 30,
+        TARGET_MAX_KW: 20
+    },
+
+    ROOM: {
+        KW_PER_INDEX: 0.65,
+        MAX_UNDERHEAT_DURATION: 900,
+        COMP_INC: 1.0,
+        MAX_COMP: 5.0
+    },
+
+    COMFORT: {
+        E_UP_C: 1.0,
+        E_DOWN_C: 0.0,
+        UP_HOLD_S: 10 * 60,
+        DOWN_HOLD_S: 60 * 60,
+        KW_PER_C: 0.9,
+        STEP_KW: 1.0
+    },
+
+    OUTDOOR_RESET: { REF_C: 16, SLOPE: 0.30 },
+    OUTDOOR_ADJ: { REF_C: 5, SLOPE: 0.25 },
+    SUN: { REF_LUX: 1000, SLOPE: -1.0 / 50000, MAX: -2.0 },
+
+    TANK: {
+        HEAT_RATE: 0.18,
+        BUFFER_L: 80,
+        SPECIFIC_HEAT: 4.186,
+        DENSITY: 1000,
+        LOSS_RATE: 30 / (6 * 3600)
+    },
+
+    KEY: {
+        OUTDOOR: "outside_temperature_state",
+        TANK: "floorheating_watertank",
+        SUN: "floorheating_sunlight",
+        MIXED: "floorheating_mixedwater_temperature_state",
+        RETURN: "floorheating_returnwater_temperature_state",
+        OUTPUT: "floorheating_outputwater_temperature_state",
+        FLOW: "floorheating_waterflow_state",
+
+        BOILER_BURNING: "boiler_burning_status",
+        BOILER_FH: "boiler_floorheating_status",
+        BOILER_HW: "boiler_hot_water_status"
+    }
+};
+
+
+// ========================= 工具函数 =========================
+function clamp(v, min, max) { return isNaN(v) ? min : Math.min(Math.max(v, min), max); }
+function f01(v) { return Math.min(Math.max(v, 0), 1); }
+function isOnLike(v) { return ["on","true","1","heat","enable","opened"].includes(String(v).toLowerCase().trim()); }
+function fmt1(v) { return Number.isFinite(v) ? Number(v).toFixed(1) : "-"; }
+function fmt0(v) { return Number.isFinite(v) ? String(Math.round(Number(v))) : "-"; }
+function nowMs() { return Date.now(); }
+
+// 锅炉状态短标记（status用，尽量短）
+// - "--"   不燃烧/未知
+// - "B+FH" 正在燃烧，且在地暖/缓冲加热（buffer_heat）
+// - "B+HW" 正在燃烧，且在生活热水（domestic）
+// - "B+"   仅燃烧但模式未知
+function boilerTagFromState(state) {
+    let tag = "--";
+    if (state && state.sys && state.sys.boilerBurning) {
+        if (state.sys.boilerMode === "buffer_heat") tag = "B+FH";
+        else if (state.sys.boilerMode === "domestic") tag = "B+HW";
+        else tag = "B+";
+    }
+    return tag;
+}
+
+function alarmDedup(code) {
+    const now = nowMs();
+    const map = context.get("fh_alarm_last_by_code") || {};
+    const last = Number(map[code]) || 0;
+    if (now - last < ALARM_CONFIG.SAME_CODE_DEDUP_MS) return false;
+    map[code] = now;
+    context.set("fh_alarm_last_by_code", map);
+    return true;
+}
+
+// 生成：msg.title=简要；msg.payload=详细（多行通俗）
+function buildAlarmMsg(code, title, lines) {
+    if (!alarmDedup(code)) return null;
+
+    const payloadLines = [];
+    if (ALARM_CONFIG.HOST && String(ALARM_CONFIG.HOST).trim()) payloadLines.push(`位置：${ALARM_CONFIG.HOST}`);
+    for (const l of (lines || [])) if (l && String(l).trim()) payloadLines.push(String(l));
+
+    return { title, payload: payloadLines.join("\n"), code };
+}
+
+
+// ========================= 默认 state + 合并 =========================
+function defaultState() {
+    return {
+        sys: { enabled: false, boilerMode: "init", boilerBurning: false, boilerFloorHeating: false },
+        ctrl: { outputRaw: 38.0, lastTargetTs: 0, lastUpdate: nowMs() },
+        thermal: { watertank: 55.0, outdoor: 10.0 },
+        sensors: {
+            sunlight: 500,
+            returnWaterTemp: 30,
+            mixedWaterTemp: 35.0,
+            outputWaterTemp: 35,
+            waterFlowM3h: 0.0,
+            deltaT_supply_return: 0.0,
+            heatPowerObsKw: 0.0,
+            heatPowerEmaKw: 0.0,
+            heatPowerTargetKw: 0.0,
+            targetDeltaT: 0.0,
+            targetTempCandidate: 0.0
+        },
+        comfort: { lastTs: nowMs(), emax: 0, upHoldS: 0, downHoldS: 0 },
+        roomStates: {},
+        valveLast: {
+            set_point: 4095,
+            ratio_ema: null,
+            sp_last_ts: 0,
+            unreachable: false,
+
+            // 兼容字段（不删）
+            load_int: 0,
+            load_last_ts: 0,
+            load_bias_level: 0,
+            load_err_kw: 0
+        }
+    };
+}
+
+function mergeState(stored) {
+    const d = defaultState();
+    const s = (stored && typeof stored === "object") ? stored : {};
+    const out = {
+        ...d,
+        ...s,
+        sys: { ...d.sys, ...(s.sys || {}) },
+        ctrl: { ...d.ctrl, ...(s.ctrl || {}) },
+        thermal: { ...d.thermal, ...(s.thermal || {}) },
+        sensors: { ...d.sensors, ...(s.sensors || {}) },
+        comfort: { ...d.comfort, ...(s.comfort || {}) },
+        roomStates: { ...d.roomStates, ...(s.roomStates || {}) },
+        valveLast: { ...d.valveLast, ...(s.valveLast || {}) }
+    };
+
+    out.ctrl.outputRaw = Number(out.ctrl.outputRaw) || d.ctrl.outputRaw;
+    out.thermal.watertank = parseFloat(Number(out.thermal.watertank).toFixed(1));
+    out.thermal.outdoor   = parseFloat(Number(out.thermal.outdoor).toFixed(1));
+    out.sensors.mixedWaterTemp = parseFloat(Number(out.sensors.mixedWaterTemp).toFixed(1));
+    out.sensors.waterFlowM3h = Number(out.sensors.waterFlowM3h) || 0;
+
+    return out;
+}
+
+
+// ========================= Recover（Output3复用） =========================
+function initRecoverCtrl(hasStored) {
+    if (!RECOVER_CONFIG.ENABLED) return;
+
+    const ready = (flow.get(RECOVER_CONFIG.READY_FLAG_KEY) === true);
+    let rc = context.get(RECOVER_CONFIG.CTX_KEY) || { need: false, attempts: 0, done: false };
+
+    if (ready) {
+        rc.need = false; rc.done = true;
+        context.set(RECOVER_CONFIG.CTX_KEY, rc);
+        return;
+    }
+
+    if (!hasStored && !rc.done) {
+        rc.need = true;
+        rc.attempts = Number(rc.attempts) || 0;
+        context.set(RECOVER_CONFIG.CTX_KEY, rc);
+
+        flow.set(RECOVER_CONFIG.READY_FLAG_KEY, false);
+        context.set(RECOVER_CONFIG.APPLIED_KEY, false);
+    }
+}
+
+function output3Payload(trigger, stateObj) {
+    if (trigger !== "timer") return { msg: null, tag: "" };
+
+    if (!RECOVER_CONFIG.ENABLED) {
+        return { msg: { payload: JSON.stringify(stateObj), topic: "fh_sync" }, tag: "" };
+    }
+
+    const ready = (flow.get(RECOVER_CONFIG.READY_FLAG_KEY) === true);
+    let rc = context.get(RECOVER_CONFIG.CTX_KEY) || { need: false, attempts: 0, done: false };
+
+    if (ready) {
+        rc.need = false; rc.done = true;
+        context.set(RECOVER_CONFIG.CTX_KEY, rc);
+        return { msg: { payload: JSON.stringify(stateObj), topic: "fh_sync" }, tag: "" };
+    }
+
+    if (rc.need) {
+        if ((rc.attempts || 0) < RECOVER_CONFIG.MAX_ATTEMPTS) {
+            rc.attempts = (rc.attempts || 0) + 1;
+            context.set(RECOVER_CONFIG.CTX_KEY, rc);
+            return { msg: { payload: "recover", topic: "fh_sync" }, tag: `🔄${rc.attempts}/${RECOVER_CONFIG.MAX_ATTEMPTS}` };
+        }
+        rc.need = false;
+        context.set(RECOVER_CONFIG.CTX_KEY, rc);
+    }
+
+    return { msg: { payload: JSON.stringify(stateObj), topic: "fh_sync" }, tag: "" };
+}
+
+
+// ========================= 房间模式（分水器开关） =========================
+function readRoomModes() {
+    const ids = ["can_ting", "ke_ting", "shu_fang", "zhu_wo", "wo_shi_1", "wo_shi_2", "wo_shi_3"];
+
+    const raw = {};
+    let anyOpen = false;
+    let allClosed = true;
+
+    for (const id of ids) {
+        const v = flow.get(`floorheating_${id}_di_nuan_state`);
+        raw[id] = v;
+
+        const on = (String(v).toLowerCase().trim() === "heat") || isOnLike(v);
+        if (on) anyOpen = true;
+        if (on) allClosed = false;
+    }
+
+    return { raw, anyOpen, allClosed };
+}
+
+function roomCur(id) { return clamp(Number(flow.get(`floorheating_${id}_di_nuan_current_temp`)) || 20, 10, 40); }
+function roomTgt(id) { return clamp(Number(flow.get(`floorheating_${id}_di_nuan_target_temp`)) || 22, 16, 35); }
+
+
+// ========================= 供水模式输出（Output6） =========================
+function buildSupplyMode(room, forceOff) {
+    if (forceOff) {
+        flow.set("floor_heating_supply_on", false);
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", state: "forced_off" };
+    }
+
+    let anyHeat = false;
+    let allOff = true;
+
+    for (const id of Object.keys(room.raw)) {
+        const s = (room.raw[id] === undefined || room.raw[id] === null) ? "" : String(room.raw[id]).toLowerCase().trim();
+        if (s === "heat") anyHeat = true;
+        if (s !== "off") allOff = false;
+    }
+
+    if (anyHeat) {
+        flow.set("floor_heating_supply_on", true);
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "heat", state: "kai" };
+    }
+    if (allOff) {
+        flow.set("floor_heating_supply_on", false);
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", state: "guan" };
+    }
+
+    return null;
+}
+
+
+// ========================= 传感器更新 =========================
+function updateSensors(state) {
+    const b1 = flow.get(SYSTEM.KEY.BOILER_BURNING);
+    const b2 = flow.get(SYSTEM.KEY.BOILER_FH);
+    state.sys.boilerBurning = (b1 !== undefined) ? isOnLike(b1) : false;
+    state.sys.boilerFloorHeating = (b2 !== undefined) ? isOnLike(b2) : false;
+
+    const out = parseFloat(flow.get(SYSTEM.KEY.OUTDOOR));
+    if (Number.isFinite(out)) state.thermal.outdoor = parseFloat(clamp(out, -30, 50).toFixed(1));
+
+    const tank = parseFloat(flow.get(SYSTEM.KEY.TANK));
+    if (Number.isFinite(tank)) state.thermal.watertank = parseFloat(clamp(tank, 10, 80).toFixed(1));
+
+    const sun = parseFloat(flow.get(SYSTEM.KEY.SUN));
+    if (Number.isFinite(sun)) state.sensors.sunlight = sun;
+
+    const Tr = parseFloat(flow.get(SYSTEM.KEY.RETURN));
+    if (Number.isFinite(Tr)) state.sensors.returnWaterTemp = Tr;
+
+    const Tm = parseFloat(flow.get(SYSTEM.KEY.MIXED));
+    if (Number.isFinite(Tm)) state.sensors.mixedWaterTemp = parseFloat(Tm.toFixed(1));
+
+    const To = parseFloat(flow.get(SYSTEM.KEY.OUTPUT));
+    if (Number.isFinite(To)) state.sensors.outputWaterTemp = To;
+
+    const Q = parseFloat(flow.get(SYSTEM.KEY.FLOW));
+    state.sensors.waterFlowM3h = Number.isFinite(Q) ? clamp(Q, 0, 5.0) : 0.0;
+
+    if (state.sys.boilerBurning) state.sys.boilerMode = state.sys.boilerFloorHeating ? "buffer_heat" : "domestic";
+    else state.sys.boilerMode = "cooling";
+}
+
+
+// ========================= 热负荷（功率观测 EMA） =========================
+function updateHeatPower(state, intervalSec) {
+    const Ts = (Number.isFinite(state.sensors.outputWaterTemp) && state.sensors.outputWaterTemp !== 0)
+        ? Number(state.sensors.outputWaterTemp)
+        : Number(state.sensors.mixedWaterTemp);
+
+    const Tr = Number(state.sensors.returnWaterTemp);
+    const Q  = Number(state.sensors.waterFlowM3h) || 0;
+
+    let dT = (Number.isFinite(Ts) && Number.isFinite(Tr)) ? (Ts - Tr) : 0;
+    if (!Number.isFinite(dT) || dT <= 0) dT = 0;
+    if (dT > 0 && dT < SYSTEM.HEAT.DT_DEADBAND_C) dT = 0;
+
+    state.sensors.deltaT_supply_return = dT;
+
+    let Pobs = 0;
+    if (Q > 0 && dT > 0) Pobs = 1.163 * Q * dT;
+    Pobs = clamp(Pobs, 0, SYSTEM.HEAT.OBS_MAX_KW);
+    state.sensors.heatPowerObsKw = Pobs;
+
+    const tau = SYSTEM.HEAT.P_EMA_TAU_S;
+    const alpha = intervalSec / (tau + intervalSec);
+    const prev = Number(state.sensors.heatPowerEmaKw) || 0;
+    state.sensors.heatPowerEmaKw = prev + alpha * (Pobs - prev);
+
+    return (state.sensors.heatPowerEmaKw * 1000) * intervalSec;
+}
+
+
+// ========================= 目标功率（房间舒适） =========================
+function updateComfort(state, now, anyOpen, room) {
+    const c = state.comfort || { lastTs: now, emax: 0, upHoldS: 0, downHoldS: 0 };
+    const dt = Math.max(1, (now - (Number(c.lastTs) || now)) / 1000);
+    c.lastTs = now;
+
+    if (!anyOpen) {
+        c.emax = 0; c.upHoldS = 0; c.downHoldS = 0;
+        state.comfort = c;
+        return c;
+    }
+
+    let emax = 0;
+    for (const id of Object.keys(room.raw)) {
+        const on = (String(room.raw[id]).toLowerCase().trim() === "heat") || isOnLike(room.raw[id]);
+        if (!on) continue;
+        emax = Math.max(emax, (roomTgt(id) - roomCur(id)));
+    }
+    c.emax = emax;
+
+    if (emax >= SYSTEM.COMFORT.E_UP_C) c.upHoldS += dt; else c.upHoldS = 0;
+    if (emax <= SYSTEM.COMFORT.E_DOWN_C) c.downHoldS += dt; else c.downHoldS = 0;
+
+    state.comfort = c;
+    return c;
+}
+
+function demandIndex(state, now, room) {
+    let idx = 0;
+
+    for (const id of Object.keys(room.raw)) {
+        const on = (String(room.raw[id]).toLowerCase().trim() === "heat") || isOnLike(room.raw[id]);
+        if (!on) continue;
+
+        if (!state.roomStates[id]) state.roomStates[id] = { under: 0, last: now, comp: 0 };
+        const rs = state.roomStates[id];
+
+        const dt = Math.max(1, (now - (Number(rs.last) || now)) / 1000);
+        rs.last = now;
+
+        const cur = roomCur(id);
+        const tgt = roomTgt(id);
+        const diff = tgt - cur;
+
+        if (diff > 0) {
+            rs.under += dt;
+            rs.comp = clamp((Number(rs.comp) || 0) + SYSTEM.ROOM.COMP_INC, 0, SYSTEM.ROOM.MAX_COMP);
+        } else {
+            rs.under = 0;
+            rs.comp = 0;
+        }
+
+        const isLiving = (id === "can_ting" || id === "ke_ting");
+        let w = (isLiving ? 1.8 : 1.0) + Math.abs(diff) * 1.0;
+
+        if ((rs.under || 0) >= SYSTEM.ROOM.MAX_UNDERHEAT_DURATION) w += 2.0;
+        if (diff > 0) idx += w * diff;
+        if (rs.comp > 0 && diff > 0) idx += rs.comp * 0.5;
+    }
+
+    return idx;
+}
+
+function powerTarget(demandIdx, comfort) {
+    let P = SYSTEM.ROOM.KW_PER_INDEX * demandIdx;
+    P += SYSTEM.COMFORT.KW_PER_C * Math.max(0, comfort.emax);
+
+    if (comfort.upHoldS >= SYSTEM.COMFORT.UP_HOLD_S) {
+        P += SYSTEM.COMFORT.STEP_KW;
+        comfort.upHoldS = 0;
+    }
+    if (comfort.downHoldS >= SYSTEM.COMFORT.DOWN_HOLD_S) {
+        P -= SYSTEM.COMFORT.STEP_KW;
+        comfort.downHoldS = 0;
+    }
+
+    return clamp(P, 0, SYSTEM.HEAT.TARGET_MAX_KW);
+}
+
+function targetDeltaT(P_target, Q_m3h, emax) {
+    let dtNeed;
+    if (Q_m3h >= SYSTEM.HEAT.NOFLOW_M3H) dtNeed = P_target / (1.163 * Q_m3h);
+    else dtNeed = 5 + 1.5 * Math.max(0, emax);
+
+    return clamp(dtNeed, SYSTEM.HEAT.DT_MIN_C, SYSTEM.HEAT.DT_MAX_C);
+}
+
+
+// ========================= 目标温度候选 + 平滑 =========================
+function outdoorResetMin(outdoor) {
+    return SYSTEM.MIN_TEMP + Math.max(0, (SYSTEM.OUTDOOR_RESET.REF_C - outdoor)) * SYSTEM.OUTDOOR_RESET.SLOPE;
+}
+function outdoorAdj(outdoor) {
+    return (SYSTEM.OUTDOOR_ADJ.REF_C - outdoor) * SYSTEM.OUTDOOR_ADJ.SLOPE;
+}
+function sunAdj(lux) {
+    const diff = lux - SYSTEM.SUN.REF_LUX;
+    let adj = diff * SYSTEM.SUN.SLOPE;
+    if (adj < SYSTEM.SUN.MAX) adj = SYSTEM.SUN.MAX;
+    return adj;
+}
+
+function smoothTarget(state, candidate, now) {
+    const last = Number(state.ctrl.lastTargetTs) || now;
+    const dt = Math.max(1, (now - last) / 1000);
+    state.ctrl.lastTargetTs = now;
+
+    const prev = Number(state.ctrl.outputRaw) || SYSTEM.MIN_TEMP;
+
+    const tau = SYSTEM.TARGET_TAU_S;
+    const alpha = dt / (tau + dt);
+    let sm = prev + alpha * (candidate - prev);
+
+    const maxStep = SYSTEM.TARGET_MAX_STEP_PER_TICK_C * (dt / SYSTEM.TICK_S);
+    sm = clamp(sm, prev - maxStep, prev + maxStep);
+
+    state.ctrl.outputRaw = clamp(sm, SYSTEM.MIN_TEMP, SYSTEM.MAX_TEMP);
+}
+
+
+// ========================= 水箱模型（可选） =========================
+function updateTankModel(state, now) {
+    const interval = (now - (Number(state.ctrl.lastUpdate) || now)) / 1000;
+    state.ctrl.lastUpdate = now;
+
+    const mass = SYSTEM.TANK.BUFFER_L * SYSTEM.TANK.DENSITY;
+    const heatDemandJ = updateHeatPower(state, interval);
+
+    let dT = 0;
+    if (state.sys.boilerMode === "buffer_heat") {
+        dT = SYSTEM.TANK.HEAT_RATE * interval;
+    } else {
+        const naturalCooling = SYSTEM.TANK.LOSS_RATE * interval;
+        const heatLossTemp = heatDemandJ / (mass * SYSTEM.TANK.SPECIFIC_HEAT * 1000);
+        dT = -(naturalCooling + heatLossTemp);
+    }
+
+    state.thermal.watertank = parseFloat(clamp(state.thermal.watertank + dT, 10, 80).toFixed(1));
+}
+
+
+// ========================= 阀门控制 V2 =========================
+function computeValveSetPointDetailsV2(state, T_target, T_meas, T_return, T_tank) {
+    const now = nowMs();
+
+    const DEAD_BAND_C = 0.25;
+    const RATIO_TAU_S = 30;
+
+    const UNREACH_ENTER_C = 0.2;
+    const UNREACH_EXIT_C  = 1.0;
+
+    // ⭐阀门动作速度（点/秒）：越小越慢越稳
+    const SP_SLEW_PER_SEC = 30;
+
+    const SP_MIN_STEP = 8;
+
+    const Kp_sp = 180;
+    const Ki_sp = 6;
+    const Kd_sp = 0;
+    const INT_LIMIT = 20;
+
+    if (!Number.isFinite(T_target) || !Number.isFinite(T_meas)) {
+        return { set_point: 4095, ff_ratio: null, unreachable: false };
+    }
+
+    const lastTs = Number(state.valveLast.sp_last_ts) || now;
+    const dt = Math.max(1, (now - lastTs) / 1000);
+    state.valveLast.sp_last_ts = now;
+
+    let unreachable = !!state.valveLast.unreachable;
+    if (Number.isFinite(T_tank)) {
+        if (!unreachable) {
+            if (T_tank <= (T_target + UNREACH_ENTER_C)) unreachable = true;
+        } else {
+            if (T_tank >= (T_target + UNREACH_EXIT_C)) unreachable = false;
+        }
+    }
+    state.valveLast.unreachable = unreachable;
+
+    let ratio = 0.5;
+    if (Number.isFinite(T_tank) && Number.isFinite(T_return)) {
+        const denom = (T_tank - T_return);
+        if (denom > 0.5) ratio = (T_target - T_return) / denom;
+    }
+    ratio = f01(ratio);
+
+    let ratioEma = Number(state.valveLast.ratio_ema);
+    if (!Number.isFinite(ratioEma)) ratioEma = ratio;
+    const alphaR = dt / (RATIO_TAU_S + dt);
+    ratioEma = f01(ratioEma + alphaR * (ratio - ratioEma));
+    state.valveLast.ratio_ema = ratioEma;
+
+    let sp_ff = 1 + Math.round(ratioEma * 4094);
+    if (unreachable) sp_ff = 4095;
+
+    let err = T_target - T_meas;
+    if (Math.abs(err) < DEAD_BAND_C) err = 0;
+
+    let integral = flow.get("integral") || 0;
+    let prevErr  = flow.get("previous_error") || 0;
+
+    if (err !== 0 && !unreachable) {
+        integral += err * dt;
+        integral = clamp(integral, -INT_LIMIT, INT_LIMIT);
+    }
+
+    flow.set("integral", integral);
+    flow.set("previous_error", err);
+
+    const derr = (err - prevErr) / dt;
+    const sp_pid = (Kp_sp * err) + (Ki_sp * integral) + (Kd_sp * derr);
+
+    let sp_target = Math.round(sp_ff + sp_pid);
+    sp_target = clamp(sp_target, 1, 4095);
+
+    let sp_prev = Number(state.valveLast.set_point);
+    if (!Number.isFinite(sp_prev)) sp_prev = sp_target;
+
+    const maxStep = Math.max(10, Math.round(SP_SLEW_PER_SEC * dt));
+    let sp = sp_target;
+
+    if (Math.abs(sp_target - sp_prev) > maxStep) {
+        sp = sp_prev + maxStep * Math.sign(sp_target - sp_prev);
+    }
+
+    if (Math.abs(sp - sp_prev) < SP_MIN_STEP) sp = sp_prev;
+
+    sp = clamp(sp, 1, 4095);
+    state.valveLast.set_point = sp;
+
+    return { set_point: sp, ff_ratio: ratioEma, unreachable };
+}
+
+
+// ========================= 系统健康监控（报警） =========================
+function resetHealth() {
+    context.set("fh_health", {
+        enableSince: 0,
+        lowFlowSince: 0,
+        lastMixed: null,
+        lastMixedChangeTs: 0,
+        noRiseSince: 0,
+        noRiseBase: null
+    });
+}
+
+function checkHealthAndBuildAlarm(state, enabled, anyOpen, T_target_ctrl, valveSp) {
+    if (!enabled || !anyOpen) {
+        resetHealth();
+        return null;
+    }
+
+    const now = nowMs();
+    const h = context.get("fh_health") || {};
+    if (!h.enableSince) h.enableSince = now;
+
+    if ((now - h.enableSince) < HEALTH.STARTUP_GRACE_S * 1000) {
+        const mixed = Number(state.sensors.mixedWaterTemp);
+        if (Number.isFinite(mixed)) {
+            if (h.lastMixed === null || Math.abs(mixed - h.lastMixed) >= 0.1) {
+                h.lastMixed = mixed;
+                h.lastMixedChangeTs = now;
+            }
+        }
+        context.set("fh_health", h);
+        return null;
+    }
+
+    const target = Number(T_target_ctrl);
+    const mixed  = Number(state.sensors.mixedWaterTemp);
+    const flowM3h = Number(state.sensors.waterFlowM3h) || 0;
+    const tank = Number(state.thermal.watertank);
+
+    const err = (Number.isFinite(target) && Number.isFinite(mixed)) ? (target - mixed) : 0;
+    const demandStrong = (err >= HEALTH.DEMAND_ERR_C);
+
+    if (Number.isFinite(mixed)) {
+        if (h.lastMixed === null || Math.abs(mixed - h.lastMixed) >= 0.1) {
+            h.lastMixed = mixed;
+            h.lastMixedChangeTs = now;
+        }
+    }
+
+    const lowFlowCond =
+        demandStrong &&
+        (Number(valveSp) >= HEALTH.VALVE_OPEN_SP) &&
+        (flowM3h < HEALTH.FLOW_LOW_M3H);
+
+    if (lowFlowCond) {
+        if (!h.lowFlowSince) h.lowFlowSince = now;
+        if ((now - h.lowFlowSince) >= HEALTH.FLOW0_HOLD_S * 1000) {
+            context.set("fh_health", h);
+            return buildAlarmMsg(
+                "FLOW0",
+                "地暖流量异常",
+                [
+                    "现象：地暖已开启且需要升温，但流量持续接近 0（严重）",
+                    `当前：目标${fmt1(target)}℃ 混水${fmt1(mixed)}℃ 水箱${fmt1(tank)}℃ 流量${fmt1(flowM3h)}m³/h 阀门${fmt0(valveSp)}`,
+                    "建议：检查循环泵是否转、过滤器是否堵、系统是否需要排气、阀门是否卡住、流量计/采集是否掉线"
+                ]
+            );
+        }
+    } else {
+        h.lowFlowSince = 0;
+    }
+
+    const staleMs = h.lastMixedChangeTs ? (now - h.lastMixedChangeTs) : 0;
+    const mixStaleCond =
+        demandStrong &&
+        (flowM3h >= HEALTH.FLOW_OK_M3H) &&
+        (staleMs >= HEALTH.MIX_STALE_HOLD_S * 1000);
+
+    if (mixStaleCond) {
+        context.set("fh_health", h);
+        return buildAlarmMsg(
+            "MIX_STALE",
+            "混水温度采集异常",
+            [
+                "现象：地暖运行中，混水温度长时间不变化（疑似传感器/采集冻结）",
+                `当前：目标${fmt1(target)}℃ 混水${fmt1(mixed)}℃ 流量${fmt1(flowM3h)}m³/h`,
+                "建议：检查 mixed 传感器、Modbus/采集链路、相关节点是否卡住"
+            ]
+        );
+    }
+
+    const boilerMode = String(state.sys.boilerMode || "");
+    const boilerBurning = !!state.sys.boilerBurning;
+
+    const tankHotEnough =
+        Number.isFinite(tank) && Number.isFinite(mixed) ? ((tank - mixed) >= HEALTH.TANK_HOT_MARGIN_C) : false;
+
+    const heatSourceAvailable = (boilerMode === "buffer_heat") && boilerBurning && tankHotEnough;
+
+    const noRiseCond =
+        demandStrong &&
+        Number.isFinite(mixed) &&
+        (flowM3h >= HEALTH.FLOW_STRONG_M3H) &&
+        heatSourceAvailable;
+
+    if (noRiseCond) {
+        if (!h.noRiseSince) {
+            h.noRiseSince = now;
+            h.noRiseBase = mixed;
+        } else {
+            const rise = mixed - Number(h.noRiseBase);
+            if ((now - h.noRiseSince) >= HEALTH.NO_RISE_HOLD_S * 1000 &&
+                rise < HEALTH.NO_RISE_DELTA_C) {
+
+                context.set("fh_health", h);
+                return buildAlarmMsg(
+                    "NO_RISE",
+                    "地暖升温异常",
+                    [
+                        "现象：锅炉在地暖加热且水箱温度足够，但混水温度长时间几乎不升（严重）",
+                        `当前：目标${fmt1(target)}℃ 混水${fmt1(mixed)}℃ 水箱${fmt1(tank)}℃ 流量${fmt1(flowM3h)}m³/h`,
+                        "建议：检查比例阀方向/动作是否正确、回路是否旁通短路、锅炉是否真正给水箱加热"
+                    ]
+                );
+            }
+
+            if (rise >= 0.3) {
+                h.noRiseSince = 0;
+                h.noRiseBase = null;
+            }
+        }
+    } else {
+        h.noRiseSince = 0;
+        h.noRiseBase = null;
+    }
+
+    context.set("fh_health", h);
+    return null;
+}
+
+
+// ========================= 主逻辑入口 =========================
+let msg_alarm = null;
+
+try {
+    const trigger = (typeof msg.payload === "string") ? msg.payload : "timer";
+    const now = nowMs();
+
+    const stored0 = flow.get(SYSTEM.STORAGE_KEY);
+    const hasStored0 = (stored0 && typeof stored0 === "object");
+    initRecoverCtrl(hasStored0);
+
+    let state = mergeState(stored0);
+
+    if (RECOVER_CONFIG.ENABLED) {
+        const ready = (flow.get(RECOVER_CONFIG.READY_FLAG_KEY) === true);
+        const applied = (context.get(RECOVER_CONFIG.APPLIED_KEY) === true);
+        if (ready && !applied) {
+            const s2 = flow.get(SYSTEM.STORAGE_KEY);
+            if (s2 && typeof s2 === "object") {
+                state = mergeState(s2);
+                context.set(RECOVER_CONFIG.APPLIED_KEY, true);
+            }
+        }
+    }
+
+    const room = readRoomModes();
+    const anyOpen = room.anyOpen;
+    const allClosed = room.allClosed;
+
+    updateSensors(state);
+
+    const enforcePressed = isOnLike(flow.get(CONTROL_RULE.ENFORCE_FLOW_KEY));
+
+    const prevEnabled = !!state.sys.enabled;
+    const outdoor = Number(state.thermal.outdoor);
+
+    let enabled = prevEnabled;
+
+    if (anyOpen && outdoor < CONTROL_RULE.OUTDOOR_THRESHOLD_C) enabled = true;
+    if (enforcePressed && anyOpen) enabled = true;
+    if (allClosed && outdoor > CONTROL_RULE.OUTDOOR_THRESHOLD_C) enabled = false;
+
+    state.sys.enabled = enabled;
+    flow.set("floorheating_state", enabled);
+
+    const out3 = output3Payload(trigger, state);
+    const msg_out3 = out3.msg;
+    const recoverTag = out3.tag;
+
+    const msg_boiler = (trigger === "timer")
+        ? { payload: (enabled ? "heat" : "off"), topic: "boiler/floorheating" }
+        : null;
+
+    let msg_enforce_reset = null;
+    if (enforcePressed) {
+        flow.set(CONTROL_RULE.ENFORCE_FLOW_KEY, "off");
+        msg_enforce_reset = { payload: "off", topic: "enforce_reset" };
+    }
+
+    let msg_supply = null;
+    if (trigger === "timer") msg_supply = buildSupplyMode(room, !enabled);
+
+    // ====== OFF 分支 ======
+    if (!enabled) {
+        resetHealth();
+        state.valveLast.set_point = 4095;
+
+        const msg_target_display = (trigger === "timer")
+            ? { payload: String(Math.round(state.ctrl.outputRaw)), topic: "fh/target_display" }
+            : null;
+
+        const msg_valve = { payload: 4095, topic: "fh/valve_sp" };
+
+        // ✅ status 增加锅炉短标记
+        const boilerTag = boilerTagFromState(state);
+        const st = [`⛔OFF`, boilerTag, `🧩4095`];
+        if (recoverTag) st.push(recoverTag);
+        node.status({ fill: "grey", shape: "ring", text: st.join("|") });
+
+        flow.set(SYSTEM.STORAGE_KEY, state);
+
+        return [msg_target_display, msg_valve, msg_out3, msg_boiler, msg_enforce_reset, msg_supply, null];
+    }
+
+    // ===================== ON 分支：综合计算 =====================
+    const comfort = updateComfort(state, now, anyOpen, room);
+    const dIdx = demandIndex(state, now, room);
+    const P_target = powerTarget(dIdx, comfort);
+    state.sensors.heatPowerTargetKw = P_target;
+
+    const Q = Number(state.sensors.waterFlowM3h) || 0;
+    const Tr = Number(state.sensors.returnWaterTemp);
+
+    const dtNeed = targetDeltaT(P_target, Q, comfort.emax);
+    state.sensors.targetDeltaT = dtNeed;
+
+    let T_candidate = (Number.isFinite(Tr) ? Tr : 30) + dtNeed;
+
+    T_candidate += outdoorAdj(outdoor);
+    T_candidate += sunAdj(Number(state.sensors.sunlight) || 0);
+
+    if (state.sys.boilerMode === "domestic") T_candidate -= 2;
+    if (state.sys.boilerMode === "cooling")  T_candidate -= 1;
+
+    T_candidate = Math.max(T_candidate, outdoorResetMin(outdoor));
+
+    const tank = Number(state.thermal.watertank);
+    if (Number.isFinite(tank) && tank > 5) T_candidate = Math.min(T_candidate, tank);
+
+    T_candidate = clamp(T_candidate, SYSTEM.MIN_TEMP, SYSTEM.MAX_TEMP);
+    state.sensors.targetTempCandidate = T_candidate;
+
+    smoothTarget(state, T_candidate, now);
+    updateTankModel(state, now);
+
+    const T_target_display = Math.round(state.ctrl.outputRaw);
+    const msg_target_display = { payload: String(T_target_display), topic: "fh/target_display" };
+
+    const T_target_ctrl = Math.round(state.ctrl.outputRaw * 10) / 10;
+
+    const T_feedback =
+        (Number.isFinite(state.sensors.mixedWaterTemp) && state.sensors.mixedWaterTemp !== 0) ? state.sensors.mixedWaterTemp :
+        (Number.isFinite(state.sensors.outputWaterTemp) && state.sensors.outputWaterTemp !== 0) ? state.sensors.outputWaterTemp :
+        state.sensors.returnWaterTemp;
+
+    const valve = computeValveSetPointDetailsV2(
+        state,
+        T_target_ctrl,
+        T_feedback,
+        Number(state.sensors.returnWaterTemp),
+        Number(state.thermal.watertank)
+    );
+
+    const valveSp = Number(valve.set_point) || 4095;
+    const msg_valve = { payload: valveSp, topic: "fh/valve_sp" };
+
+    msg_alarm = checkHealthAndBuildAlarm(state, enabled, anyOpen, T_target_ctrl, valveSp);
+
+    // ✅ status 增加锅炉短标记
+    const boilerTag = boilerTagFromState(state);
+
+    const f = Number(state.sensors.waterFlowM3h) || 0;
+    const Pema = Number(state.sensors.heatPowerEmaKw) || 0;
+    const Pt = Number(state.sensors.heatPowerTargetKw) || 0;
+
+    const st = [];
+    if (recoverTag) st.push(recoverTag);
+    st.push("🔥ON");
+    st.push(boilerTag); // ✅ 新增
+    st.push(`🎯${T_target_ctrl.toFixed(1)}`);
+    st.push(`🌡️${Number(state.sensors.mixedWaterTemp).toFixed(1)}`);
+    st.push(`🧩${valveSp}`);
+    st.push(`💧${f.toFixed(2)}`);
+    st.push(`⚡${Pema.toFixed(1)}/${Pt.toFixed(1)}`);
+
+    // 报警时也带锅炉标记（短）
+    if (msg_alarm) {
+        node.status({ fill: "red", shape: "ring", text: `⚠️${msg_alarm.title}|${boilerTag}` });
+    } else {
+        node.status({ fill: "green", shape: "dot", text: st.join("|") });
+    }
+
+    flow.set(SYSTEM.STORAGE_KEY, state);
+
+    return [msg_target_display, msg_valve, msg_out3, msg_boiler, msg_enforce_reset, msg_supply, msg_alarm];
+
+} catch (e) {
+    node.error(`[FATAL] ${e.message}`);
+
+    const crash = buildAlarmMsg(
+        "CODE_ERR",
+        "地暖控制程序异常",
+        [
+            "现象：主控 Function 运行报错，系统可能停止正常调节",
+            `错误：${e.message}`,
+            "建议：查看 Node-RED 日志/近期改动/传感器输入是否异常"
+        ]
+    );
+
+    node.status({ fill: "red", shape: "ring", text: "❌ERR|🧩4095" });
+
+    return [
+        { payload: String(SYSTEM.MIN_TEMP), topic: "fh/target_display" },
+        { payload: 4095, topic: "fh/valve_sp" },
+        null,
+        { payload: "off", topic: "boiler/floorheating" },
+        null,
+        { topic: "climate/dinuan/gongshui/mode/set", payload: "off" },
+        crash
+    ];
+}
