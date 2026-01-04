@@ -428,7 +428,7 @@ ratio = \frac{T_{target}-T_{return}}{T_{tank}-T_{return}}
   主控会在 timer tick 上发 `"recover"`，最多 `MAX_ATTEMPTS=2` 次。
 * 若 ready=true：主控每 tick 都发 `JSON.stringify(state)` 快照。
 
-### 10.2 推荐的“远端状态仓库”实现（示例逻辑）
+### 10.2 “远端状态仓库”实现（示例逻辑）
 
 **远端（B 节点）**：
 
@@ -446,7 +446,7 @@ ratio = \frac{T_{target}-T_{return}}{T_{tank}-T_{return}}
 
 > 主控内部会检测 ready=true 且 applied=false，然后只应用一次（防重复）。
 
-### 10.3 推荐你在仓库里附带的 Recover 写回 Function（模板）
+### 10.3  Recover 写回 Function（模板）
 
 你可以在 README 里给一个标准模板，方便复制：
 
@@ -753,7 +753,7 @@ SPDX-License-Identifier: GPL-3.0-only
 
 ---
 
-## 附录 A：推荐的“上游写 flow”模板（可复制）
+## 附录 A：“上游写 flow”模板（可复制）
 
 > 你可以在 Node-RED 里用多个 Function 节点接 HA state changed，把数据标准化后写入 flow。
 
