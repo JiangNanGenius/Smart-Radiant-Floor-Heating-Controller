@@ -1,5 +1,5 @@
 // ============================================================
-// 地暖综合控制主代码 v25.6 (FINAL + 注释补全版 + 锅炉状态status + Debug Output8)
+// 地暖综合控制主代码 v25.7 (FINAL + 注释补全版 + 锅炉状态status + Debug Output8 + PowerGapBoost)
 // timer = 5秒
 // Outputs = 8
 //
@@ -132,6 +132,13 @@ const SYSTEM = {
     OUTDOOR_ADJ: { REF_C: 5, SLOPE: 0.25 },
     SUN: { REF_LUX: 1000, SLOPE: -1.0 / 50000, MAX: -2.0 },
 
+    POWER_GAP_BOOST: {
+        GAP_START_KW: 1.2,
+        KW_TO_C: 0.9,
+        MAX_C: 6.0,
+        UNDERHEAT_OA_FLOOR_C: -0.8
+    },
+
     TANK: {
         HEAT_RATE: 0.18,
         BUFFER_L: 80,
@@ -236,6 +243,8 @@ function buildDebugMsgs(trigger, state, room, enabled, valveSp, T_target_ctrl, m
                 targetCtrl: safe(T_target_ctrl, safe(state?.ctrl?.outputRaw, SYSTEM.MIN_TEMP)),
                 targetCandidate: safe(state?.sensors?.targetTempCandidate),
                 targetDeltaT: safe(state?.sensors?.targetDeltaT),
+                heatPowerEmaKw: safe(state?.sensors?.heatPowerEmaKw, 0),
+                heatPowerTargetKw: safe(state?.sensors?.heatPowerTargetKw, 0),
                 valveSetPoint: Number.isFinite(Number(valveSp)) ? Number(valveSp) : Number(state?.valveLast?.set_point) || 4095
             }
         },
@@ -970,11 +979,22 @@ try {
 
     let T_candidate = (Number.isFinite(Tr) ? Tr : 30) + dtNeed;
 
-    T_candidate += outdoorAdj(outdoor);
+    const emaxNow = Number(comfort.emax) || 0;
+    let oa = outdoorAdj(outdoor);
+    if (emaxNow > 0.5 && oa < SYSTEM.POWER_GAP_BOOST.UNDERHEAT_OA_FLOOR_C) {
+        oa = SYSTEM.POWER_GAP_BOOST.UNDERHEAT_OA_FLOOR_C;
+    }
+
+    T_candidate += oa;
     T_candidate += sunAdj(Number(state.sensors.sunlight) || 0);
 
     if (state.sys.boilerMode === "domestic") T_candidate -= 2;
-    if (state.sys.boilerMode === "cooling")  T_candidate -= 1;
+
+    const PemaNow = Number(state.sensors.heatPowerEmaKw) || 0;
+    const powerGapKw = Math.max(0, P_target - PemaNow);
+    const gapOver = Math.max(0, powerGapKw - SYSTEM.POWER_GAP_BOOST.GAP_START_KW);
+    const gapBoost = clamp(gapOver * SYSTEM.POWER_GAP_BOOST.KW_TO_C, 0, SYSTEM.POWER_GAP_BOOST.MAX_C);
+    T_candidate += gapBoost;
 
     T_candidate = Math.max(T_candidate, outdoorResetMin(outdoor));
 
