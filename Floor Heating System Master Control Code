@@ -1,7 +1,7 @@
 // ============================================================
-// 地暖综合控制主代码 v25.5 (FINAL + 注释补全版 + 锅炉状态status)
+// 地暖综合控制主代码 v25.6 (FINAL + 注释补全版 + 锅炉状态status + Debug Output8)
 // timer = 5秒
-// Outputs = 7
+// Outputs = 8
 //
 // 1) 目标温度显示（整数，仅前端显示） msg.payload="44"
 // 2) 阀门开度（1~4095） msg.payload=1920
@@ -10,6 +10,7 @@
 // 5) 强制开关回弹：enforce按下后自动关（给 HA action 节点）
 // 6) 物理供水温控器模式：msg.topic + msg.payload(heat/off)
 // 7) 严重系统故障报警（微信推送）：msg.title(简要) + msg.payload(详细多行)
+// 8) 调试输出（数组消息，按类别拆分，接 debug 节点）
 //
 // 传感器分辨率（已确认）
 // - floorheating_mixedwater_temperature_state : 0.1℃（混水，控制主反馈）
@@ -197,6 +198,71 @@ function buildAlarmMsg(code, title, lines) {
     for (const l of (lines || [])) if (l && String(l).trim()) payloadLines.push(String(l));
 
     return { title, payload: payloadLines.join("\n"), code };
+}
+
+function buildDebugMsgs(trigger, state, room, enabled, valveSp, T_target_ctrl, msg_alarm, recoverTag) {
+    if (trigger !== "timer") return null;
+
+    const safe = (v, d = null) => Number.isFinite(Number(v)) ? Number(v) : d;
+
+    return [
+        {
+            topic: "fh/debug/system",
+            payload: {
+                enabled: !!enabled,
+                boilerMode: state?.sys?.boilerMode,
+                boilerBurning: !!state?.sys?.boilerBurning,
+                boilerFloorHeating: !!state?.sys?.boilerFloorHeating,
+                recoverTag: recoverTag || "",
+                ts: nowMs()
+            }
+        },
+        {
+            topic: "fh/debug/sensors",
+            payload: {
+                outdoor: safe(state?.thermal?.outdoor),
+                watertank: safe(state?.thermal?.watertank),
+                mixedWaterTemp: safe(state?.sensors?.mixedWaterTemp),
+                outputWaterTemp: safe(state?.sensors?.outputWaterTemp),
+                returnWaterTemp: safe(state?.sensors?.returnWaterTemp),
+                waterFlowM3h: safe(state?.sensors?.waterFlowM3h),
+                sunlight: safe(state?.sensors?.sunlight)
+            }
+        },
+        {
+            topic: "fh/debug/control",
+            payload: {
+                targetDisplay: Math.round(Number(state?.ctrl?.outputRaw) || SYSTEM.MIN_TEMP),
+                targetCtrl: safe(T_target_ctrl, safe(state?.ctrl?.outputRaw, SYSTEM.MIN_TEMP)),
+                targetCandidate: safe(state?.sensors?.targetTempCandidate),
+                targetDeltaT: safe(state?.sensors?.targetDeltaT),
+                valveSetPoint: Number.isFinite(Number(valveSp)) ? Number(valveSp) : Number(state?.valveLast?.set_point) || 4095
+            }
+        },
+        {
+            topic: "fh/debug/power",
+            payload: {
+                heatPowerObsKw: safe(state?.sensors?.heatPowerObsKw, 0),
+                heatPowerEmaKw: safe(state?.sensors?.heatPowerEmaKw, 0),
+                heatPowerTargetKw: safe(state?.sensors?.heatPowerTargetKw, 0),
+                deltaT_supply_return: safe(state?.sensors?.deltaT_supply_return, 0)
+            }
+        },
+        {
+            topic: "fh/debug/rooms",
+            payload: {
+                anyOpen: !!room?.anyOpen,
+                allClosed: !!room?.allClosed,
+                raw: room?.raw || {}
+            }
+        },
+        {
+            topic: "fh/debug/alarm",
+            payload: msg_alarm
+                ? { active: true, title: msg_alarm.title || "", code: msg_alarm.code || "", detail: msg_alarm.payload || "" }
+                : { active: false }
+        }
+    ];
 }
 
 
@@ -885,7 +951,9 @@ try {
 
         flow.set(SYSTEM.STORAGE_KEY, state);
 
-        return [msg_target_display, msg_valve, msg_out3, msg_boiler, msg_enforce_reset, msg_supply, null];
+        const msg_debug = buildDebugMsgs(trigger, state, room, enabled, 4095, state.ctrl.outputRaw, null, recoverTag);
+
+        return [msg_target_display, msg_valve, msg_out3, msg_boiler, msg_enforce_reset, msg_supply, null, msg_debug];
     }
 
     // ===================== ON 分支：综合计算 =====================
@@ -968,7 +1036,9 @@ try {
 
     flow.set(SYSTEM.STORAGE_KEY, state);
 
-    return [msg_target_display, msg_valve, msg_out3, msg_boiler, msg_enforce_reset, msg_supply, msg_alarm];
+    const msg_debug = buildDebugMsgs(trigger, state, room, enabled, valveSp, T_target_ctrl, msg_alarm, recoverTag);
+
+    return [msg_target_display, msg_valve, msg_out3, msg_boiler, msg_enforce_reset, msg_supply, msg_alarm, msg_debug];
 
 } catch (e) {
     node.error(`[FATAL] ${e.message}`);
@@ -985,6 +1055,10 @@ try {
 
     node.status({ fill: "red", shape: "ring", text: "❌ERR|🧩4095" });
 
+    const fallbackState = mergeState(flow.get(SYSTEM.STORAGE_KEY));
+    const fallbackRoom = readRoomModes();
+    const msg_debug = buildDebugMsgs("timer", fallbackState, fallbackRoom, false, 4095, SYSTEM.MIN_TEMP, crash, "");
+
     return [
         { payload: String(SYSTEM.MIN_TEMP), topic: "fh/target_display" },
         { payload: 4095, topic: "fh/valve_sp" },
@@ -992,6 +1066,7 @@ try {
         { payload: "off", topic: "boiler/floorheating" },
         null,
         { topic: "climate/dinuan/gongshui/mode/set", payload: "off" },
-        crash
+        crash,
+        msg_debug
     ];
 }
