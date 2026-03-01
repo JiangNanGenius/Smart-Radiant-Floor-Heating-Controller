@@ -1,5 +1,5 @@
 // ============================================================
-// 地暖综合控制主代码 v25.7 (FINAL + 注释补全版 + 锅炉状态status + Debug Output8 + PowerGapBoost)
+// 地暖综合控制主代码 v25.8 (FINAL + 注释补全版 + 锅炉状态status + Debug Output8 + HA action兼容)
 // timer = 5秒
 // Outputs = 8
 //
@@ -8,7 +8,7 @@
 // 3) WS同步/恢复：正常=JSON字符串快照；无本地数据=先发"recover"(最多2次)
 // 4) 锅炉地暖命令：msg.payload="heat"/"off"（用于反复下发给锅炉）
 // 5) 强制开关回弹：enforce按下后自动关（给 HA action 节点）
-// 6) 物理供水温控器模式：msg.topic + msg.payload(heat/off)
+// 6) 物理供水温控器模式：msg.topic + msg.payload(heat/off) + msg.action(climate.set_hvac_mode)
 // 7) 严重系统故障报警（微信推送）：msg.title(简要) + msg.payload(详细多行)
 // 8) 调试输出（数组消息，按类别拆分，接 debug 节点）
 //
@@ -417,7 +417,7 @@ function roomTgt(id) { return clamp(Number(flow.get(`floorheating_${id}_di_nuan_
 function buildSupplyMode(room, forceOff) {
     if (forceOff) {
         flow.set("floor_heating_supply_on", false);
-        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", state: "forced_off" };
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", action: "climate.set_hvac_mode", data: { hvac_mode: "off" }, state: "forced_off" };
     }
 
     let anyHeat = false;
@@ -431,11 +431,11 @@ function buildSupplyMode(room, forceOff) {
 
     if (anyHeat) {
         flow.set("floor_heating_supply_on", true);
-        return { topic: "climate/dinuan/gongshui/mode/set", payload: "heat", state: "kai" };
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "heat", action: "climate.set_hvac_mode", data: { hvac_mode: "heat" }, state: "kai" };
     }
     if (allOff) {
         flow.set("floor_heating_supply_on", false);
-        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", state: "guan" };
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", action: "climate.set_hvac_mode", data: { hvac_mode: "off" }, state: "guan" };
     }
 
     return null;
@@ -1085,7 +1085,7 @@ try {
         null,
         { payload: "off", topic: "boiler/floorheating" },
         null,
-        { topic: "climate/dinuan/gongshui/mode/set", payload: "off" },
+        { topic: "climate/dinuan/gongshui/mode/set", payload: "off", action: "climate.set_hvac_mode", data: { hvac_mode: "off" } },
         crash,
         msg_debug
     ];

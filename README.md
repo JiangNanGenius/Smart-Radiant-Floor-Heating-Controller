@@ -5,8 +5,8 @@
 
 Smart Radiant Floor Heating Controller (Node-RED)
 
-**版本 / Version**: **v25.7 (FINAL)**
-**最后更新 / Last updated**: 2026-02-26 (tuning update)
+**版本 / Version**: **v25.8 (FINAL)**
+**最后更新 / Last updated**: 2026-03-02
 **运行环境 / Runtime**: Node-RED（强烈建议启用 file-based context / localfilesystem）
 **输出 / Outputs**: 8（目标温度显示、阀门开度、WS 同步/恢复、锅炉命令、强制回弹、供水温控器模式、严重报警、分类调试输出）
 **Tick / Timer**: 5 秒
@@ -87,7 +87,7 @@ A production-grade radiant floor heating controller implemented in Node-RED. Eve
     └─ 房间：floorheating_<room>_di_nuan_state/current/target
                    │
                    ▼
-      [Function] 地暖综合控制主代码 v25.7 (每 5 秒)
+      [Function] 地暖综合控制主代码 v25.8 (每 5 秒)
       - enable/disable 判定 + 强制回弹
       - 目标功率 kW 估算
       - 目标混水温度候选 + 平滑
@@ -218,11 +218,18 @@ contextStorage: {
 
 * **topic**: `climate/dinuan/gongshui/mode/set`
 * **payload**: `"heat"` 或 `"off"`
+* **action**: `"climate.set_hvac_mode"`（HA action 节点可直接消费）
+* **data.hvac_mode**: `"heat"` 或 `"off"`
 
 示例：
 
 ```json
-{ "topic": "climate/dinuan/gongshui/mode/set", "payload": "heat" }
+{
+  "topic": "climate/dinuan/gongshui/mode/set",
+  "payload": "heat",
+  "action": "climate.set_hvac_mode",
+  "data": { "hvac_mode": "heat" }
+}
 ```
 
 ### Output7：严重报警（微信推送）
@@ -715,7 +722,7 @@ A：这是你的“快开+排气”策略。关闭时全开可帮助排气/减�
 **Q2：为什么锅炉命令每 5 秒都发一次？**
 A：为了“反复下发确保可靠”。如果你不想这么频繁，可以在 Output4 下游加一层限频或仅状态变化时下发。
 
-**Q3：为什么 state key 叫 fh_v24_final，但版本是 v25.7？**
+**Q3：为什么 state key 叫 fh_v24_final，但版本是 v25.8？**
 A：这是历史兼容命名。可以改，但要同时改 `RECOVER_CONFIG.STORAGE_KEY` 与所有恢复写回节点。
 
 **Q4：我房间多/少怎么办？**
@@ -729,6 +736,11 @@ A：必须统一。若你是 L/min：
 ---
 
 ## 17. 变更记录 / Changelog
+
+### v25.8 (2026-03-02)
+
+* Output6 增加 `msg.action=climate.set_hvac_mode` 与 `msg.data.hvac_mode`，兼容 Home Assistant action 节点，避免出现 `"action" is not allowed to be empty`。
+* 保持原有 `topic/payload` 不变，兼容既有下游流程。
 
 ### v25.7 (2026-02-26)
 
