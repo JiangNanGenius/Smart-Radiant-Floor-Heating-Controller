@@ -1,9 +1,9 @@
 // ============================================================
-// 地暖综合控制主代码 v25.8 (FINAL + 注释补全版 + 锅炉状态status + Debug Output8 + HA action兼容)
+// 地暖综合控制主代码 v25.9 (FINAL + 注释补全版 + 锅炉状态status + Output1/6 HA action兼容)
 // timer = 5秒
 // Outputs = 8
 //
-// 1) 目标温度显示（整数，仅前端显示） msg.payload="44"
+// 1) 目标温度显示（整数）msg.payload="44" + msg.action(number.set_value) + msg.data.value
 // 2) 阀门开度（1~4095） msg.payload=1920
 // 3) WS同步/恢复：正常=JSON字符串快照；无本地数据=先发"recover"(最多2次)
 // 4) 锅炉地暖命令：msg.payload="heat"/"off"（用于反复下发给锅炉）
@@ -170,6 +170,17 @@ function isOnLike(v) { return ["on","true","1","heat","enable","opened"].include
 function fmt1(v) { return Number.isFinite(v) ? Number(v).toFixed(1) : "-"; }
 function fmt0(v) { return Number.isFinite(v) ? String(Math.round(Number(v))) : "-"; }
 function nowMs() { return Date.now(); }
+
+
+function buildTargetDisplayMsg(v) {
+    const n = Math.round(Number(v) || SYSTEM.MIN_TEMP);
+    return {
+        topic: "fh/target_display",
+        payload: String(n),
+        action: "number.set_value",
+        data: { value: n }
+    };
+}
 
 // 锅炉状态短标记（status用，尽量短）
 // - "--"   不燃烧/未知
@@ -947,7 +958,7 @@ try {
         state.valveLast.set_point = 4095;
 
         const msg_target_display = (trigger === "timer")
-            ? { payload: String(Math.round(state.ctrl.outputRaw)), topic: "fh/target_display" }
+            ? buildTargetDisplayMsg(state.ctrl.outputRaw)
             : null;
 
         const msg_valve = { payload: 4095, topic: "fh/valve_sp" };
@@ -1008,7 +1019,7 @@ try {
     updateTankModel(state, now);
 
     const T_target_display = Math.round(state.ctrl.outputRaw);
-    const msg_target_display = { payload: String(T_target_display), topic: "fh/target_display" };
+    const msg_target_display = buildTargetDisplayMsg(T_target_display);
 
     const T_target_ctrl = Math.round(state.ctrl.outputRaw * 10) / 10;
 
@@ -1080,7 +1091,7 @@ try {
     const msg_debug = buildDebugMsgs("timer", fallbackState, fallbackRoom, false, 4095, SYSTEM.MIN_TEMP, crash, "");
 
     return [
-        { payload: String(SYSTEM.MIN_TEMP), topic: "fh/target_display" },
+        buildTargetDisplayMsg(SYSTEM.MIN_TEMP),
         { payload: 4095, topic: "fh/valve_sp" },
         null,
         { payload: "off", topic: "boiler/floorheating" },
