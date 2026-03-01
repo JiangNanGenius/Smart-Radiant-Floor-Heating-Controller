@@ -1,14 +1,14 @@
 // ============================================================
-// 地暖综合控制主代码 v26.1 (FINAL + 注释补全版 + 输出动作模式可切换)
+// 地暖综合控制主代码 v26.2 (FINAL + 注释补全版 + PowerGapBoost重构版)
 // timer = 5秒
 // Outputs = 8
 //
-// 1) 目标温度显示（整数）支持 action/data 与 ha_action/ha_data（可切换）
+// 1) 目标温度显示（整数，仅前端显示） msg.payload="44"
 // 2) 阀门开度（1~4095） msg.payload=1920
 // 3) WS同步/恢复：正常=JSON字符串快照；无本地数据=先发"recover"(最多2次)
 // 4) 锅炉地暖命令：msg.payload="heat"/"off"（用于反复下发给锅炉）
 // 5) 强制开关回弹：enforce按下后自动关（给 HA action 节点）
-// 6) 物理供水温控器模式：支持 action/data 与 ha_action/ha_data（可切换）
+// 6) 物理供水温控器模式：msg.topic + msg.payload(heat/off)
 // 7) 严重系统故障报警（微信推送）：msg.title(简要) + msg.payload(详细多行)
 // 8) 调试输出（数组消息，按类别拆分，接 debug 节点）
 //
@@ -133,9 +133,14 @@ const SYSTEM = {
     SUN: { REF_LUX: 1000, SLOPE: -1.0 / 50000, MAX: -2.0 },
 
     POWER_GAP_BOOST: {
-        GAP_START_KW: 1.2,
-        KW_TO_C: 0.9,
-        MAX_C: 6.0,
+        ENABLED: true,
+        ENTER_GAP_KW: 1.5,
+        EXIT_GAP_KW: 0.8,
+        GAIN_C_PER_KW: 0.7,
+        MAX_C: 4.0,
+        RAMP_UP_C_PER_TICK: 0.25,
+        RAMP_DOWN_C_PER_TICK: 0.15,
+        HOLD_S: 180,
         UNDERHEAT_OA_FLOOR_C: -0.8
     },
 
@@ -172,31 +177,10 @@ function fmt0(v) { return Number.isFinite(v) ? String(Math.round(Number(v))) : "
 function nowMs() { return Date.now(); }
 
 
-const OUTPUT_ACTION = {
-    // ha: 同时输出 action/data + ha_action/ha_data（默认，直连 HA action 节点）
-    // mqtt_safe: 仅输出 ha_action/ha_data（避免某些 MQTT 节点解析 msg.action）
-    MODE_FLOW_KEY: "fh_output_action_mode",
-    DEFAULT_MODE: "ha"
-};
-
-function actionMode() {
-    const m = String(flow.get(OUTPUT_ACTION.MODE_FLOW_KEY) || OUTPUT_ACTION.DEFAULT_MODE).toLowerCase();
-    return (m === "mqtt_safe") ? "mqtt_safe" : "ha";
-}
-
-function withActionFields(baseMsg, action, data) {
-    const out = { ...baseMsg, ha_action: action, ha_data: data };
-    if (actionMode() === "ha") {
-        out.action = action;
-        out.data = data;
-    }
-    return out;
-}
-
 
 function buildTargetDisplayMsg(v) {
     const n = Math.round(Number(v) || SYSTEM.MIN_TEMP);
-    return withActionFields({ topic: "fh/target_display", payload: String(n) }, "number.set_value", { value: n });
+    return { topic: "fh/target_display", payload: String(n) };
 }
 
 // 锅炉状态短标记（status用，尽量短）
@@ -273,6 +257,8 @@ function buildDebugMsgs(trigger, state, room, enabled, valveSp, T_target_ctrl, m
                 targetDeltaT: safe(state?.sensors?.targetDeltaT),
                 heatPowerEmaKw: safe(state?.sensors?.heatPowerEmaKw, 0),
                 heatPowerTargetKw: safe(state?.sensors?.heatPowerTargetKw, 0),
+                powerGapKw: safe((Number(state?.sensors?.heatPowerTargetKw) || 0) - (Number(state?.sensors?.heatPowerEmaKw) || 0), 0),
+                gapBoostC: safe(state?.ctrl?.gapBoostC, 0),
                 valveSetPoint: Number.isFinite(Number(valveSp)) ? Number(valveSp) : Number(state?.valveLast?.set_point) || 4095
             }
         },
@@ -307,7 +293,7 @@ function buildDebugMsgs(trigger, state, room, enabled, valveSp, T_target_ctrl, m
 function defaultState() {
     return {
         sys: { enabled: false, boilerMode: "init", boilerBurning: false, boilerFloorHeating: false },
-        ctrl: { outputRaw: 38.0, lastTargetTs: 0, lastUpdate: nowMs() },
+        ctrl: { outputRaw: 38.0, lastTargetTs: 0, lastUpdate: nowMs(), gapBoostC: 0, gapBoostHoldUntil: 0 },
         thermal: { watertank: 55.0, outdoor: 10.0 },
         sensors: {
             sunlight: 500,
@@ -445,7 +431,7 @@ function roomTgt(id) { return clamp(Number(flow.get(`floorheating_${id}_di_nuan_
 function buildSupplyMode(room, forceOff) {
     if (forceOff) {
         flow.set("floor_heating_supply_on", false);
-        return withActionFields({ topic: "climate/dinuan/gongshui/mode/set", payload: "off", state: "forced_off" }, "climate.set_hvac_mode", { hvac_mode: "off" });
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", state: "forced_off" };
     }
 
     let anyHeat = false;
@@ -459,11 +445,11 @@ function buildSupplyMode(room, forceOff) {
 
     if (anyHeat) {
         flow.set("floor_heating_supply_on", true);
-        return withActionFields({ topic: "climate/dinuan/gongshui/mode/set", payload: "heat", state: "kai" }, "climate.set_hvac_mode", { hvac_mode: "heat" });
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "heat", state: "kai" };
     }
     if (allOff) {
         flow.set("floor_heating_supply_on", false);
-        return withActionFields({ topic: "climate/dinuan/gongshui/mode/set", payload: "off", state: "guan" }, "climate.set_hvac_mode", { hvac_mode: "off" });
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", state: "guan" };
     }
 
     return null;
@@ -1020,9 +1006,30 @@ try {
 
     const PemaNow = Number(state.sensors.heatPowerEmaKw) || 0;
     const powerGapKw = Math.max(0, P_target - PemaNow);
-    const gapOver = Math.max(0, powerGapKw - SYSTEM.POWER_GAP_BOOST.GAP_START_KW);
-    const gapBoost = clamp(gapOver * SYSTEM.POWER_GAP_BOOST.KW_TO_C, 0, SYSTEM.POWER_GAP_BOOST.MAX_C);
-    T_candidate += gapBoost;
+    let gapBoostNow = Number(state.ctrl.gapBoostC) || 0;
+    let holdUntil = Number(state.ctrl.gapBoostHoldUntil) || 0;
+
+    const pgb = SYSTEM.POWER_GAP_BOOST;
+    const canBoost = pgb.ENABLED && anyOpen && enabled && comfort.emax > 0.2;
+    const enter = (powerGapKw >= pgb.ENTER_GAP_KW);
+    const keep = (now < holdUntil) || (powerGapKw >= pgb.EXIT_GAP_KW);
+
+    let desiredBoost = 0;
+    if (canBoost && (enter || (gapBoostNow > 0 && keep))) {
+        const gapOver = Math.max(0, powerGapKw - pgb.EXIT_GAP_KW);
+        desiredBoost = clamp(gapOver * pgb.GAIN_C_PER_KW, 0, pgb.MAX_C);
+        holdUntil = now + pgb.HOLD_S * 1000;
+    }
+
+    const upStep = pgb.RAMP_UP_C_PER_TICK;
+    const downStep = pgb.RAMP_DOWN_C_PER_TICK;
+    if (desiredBoost > gapBoostNow) gapBoostNow = Math.min(desiredBoost, gapBoostNow + upStep);
+    else gapBoostNow = Math.max(desiredBoost, gapBoostNow - downStep);
+
+    gapBoostNow = clamp(gapBoostNow, 0, pgb.MAX_C);
+    state.ctrl.gapBoostC = gapBoostNow;
+    state.ctrl.gapBoostHoldUntil = holdUntil;
+    T_candidate += gapBoostNow;
 
     T_candidate = Math.max(T_candidate, outdoorResetMin(outdoor));
 
@@ -1113,7 +1120,7 @@ try {
         null,
         { payload: "off", topic: "boiler/floorheating" },
         null,
-        withActionFields({ topic: "climate/dinuan/gongshui/mode/set", payload: "off" }, "climate.set_hvac_mode", { hvac_mode: "off" }),
+        { topic: "climate/dinuan/gongshui/mode/set", payload: "off" },
         crash,
         msg_debug
     ];

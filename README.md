@@ -5,8 +5,8 @@
 
 Smart Radiant Floor Heating Controller (Node-RED)
 
-**版本 / Version**: **v26.1 (FINAL)**
-**最后更新 / Last updated**: 2026-03-02 (action mode switch)
+**版本 / Version**: **v26.2 (FINAL)**
+**最后更新 / Last updated**: 2026-03-02 (PowerGapBoost rework)
 **运行环境 / Runtime**: Node-RED（强烈建议启用 file-based context / localfilesystem）
 **输出 / Outputs**: 8（目标温度显示、阀门开度、WS 同步/恢复、锅炉命令、强制回弹、供水温控器模式、严重报警、分类调试输出）
 **Tick / Timer**: 5 秒
@@ -87,7 +87,7 @@ A production-grade radiant floor heating controller implemented in Node-RED. Eve
     └─ 房间：floorheating_<room>_di_nuan_state/current/target
                    │
                    ▼
-      [Function] 地暖综合控制主代码 v26.1 (每 5 秒)
+      [Function] 地暖综合控制主代码 v26.2 (每 5 秒)
       - enable/disable 判定 + 强制回弹
       - 目标功率 kW 估算
       - 目标混水温度候选 + 平滑
@@ -148,26 +148,15 @@ contextStorage: {
 
 > 下面是“主控 Function 每次 tick 的输出数据格式”。你可以据此写 Switch/MQTT/HA action 节点，不会踩坑。
 
-### Output1：目标温度显示（前端展示 + HA 提示字段）
+### Output1：目标温度显示（仅前端展示）
 
 * **topic**: `fh/target_display`
 * **payload**: `"44"`（字符串，整数 °C）
-* **action**: `"number.set_value"`（默认模式下输出）
-* **data.value**: `44`（默认模式下输出）
-* **ha_action**: `"number.set_value"`（始终输出）
-* **ha_data.value**: `44`（number，始终输出）
 
 示例：
 
 ```json
-{
-  "topic": "fh/target_display",
-  "payload": "44",
-  "action": "number.set_value",
-  "data": { "value": 44 },
-  "ha_action": "number.set_value",
-  "ha_data": { "value": 44 }
-}
+{ "topic": "fh/target_display", "payload": "44" }
 ```
 
 ### Output2：阀门开度（12-bit）
@@ -229,22 +218,12 @@ contextStorage: {
 
 * **topic**: `climate/dinuan/gongshui/mode/set`
 * **payload**: `"heat"` 或 `"off"`
-* **action**: `"climate.set_hvac_mode"`（默认模式下输出）
-* **data.hvac_mode**: `"heat"` 或 `"off"`（默认模式下输出）
-* **ha_action**: `"climate.set_hvac_mode"`（始终输出）
-* **ha_data.hvac_mode**: `"heat"` 或 `"off"`（始终输出）
+
 
 示例：
 
 ```json
-{
-  "topic": "climate/dinuan/gongshui/mode/set",
-  "payload": "heat",
-  "action": "climate.set_hvac_mode",
-  "data": { "hvac_mode": "heat" },
-  "ha_action": "climate.set_hvac_mode",
-  "ha_data": { "hvac_mode": "heat" }
-}
+{ "topic": "climate/dinuan/gongshui/mode/set", "payload": "heat" }
 ```
 
 ### Output7：严重报警（微信推送）
@@ -678,8 +657,7 @@ return null;
 ### 14.2 供水温控器模式（Output6）
 
 Output6 topic 固定：`climate/dinuan/gongshui/mode/set`
-默认模式会直接输出 `action/data`（可直连 HA action）。
-如你有 MQTT 节点报 `Invalid action specified`，设置 `flow.fh_output_action_mode = "mqtt_safe"`，仅输出 `ha_action/ha_data`。
+下游可直接接 HA `call-service`（climate.set_hvac_mode）或 MQTT bridging。
 
 ### 14.3 锅炉命令（Output4）
 
@@ -738,7 +716,7 @@ A：这是你的“快开+排气”策略。关闭时全开可帮助排气/减�
 **Q2：为什么锅炉命令每 5 秒都发一次？**
 A：为了“反复下发确保可靠”。如果你不想这么频繁，可以在 Output4 下游加一层限频或仅状态变化时下发。
 
-**Q3：为什么 state key 叫 fh_v24_final，但版本是 v26.1？**
+**Q3：为什么 state key 叫 fh_v24_final，但版本是 v26.2？**
 A：这是历史兼容命名。可以改，但要同时改 `RECOVER_CONFIG.STORAGE_KEY` 与所有恢复写回节点。
 
 **Q4：我房间多/少怎么办？**
@@ -752,6 +730,12 @@ A：必须统一。若你是 L/min：
 ---
 
 ## 17. 变更记录 / Changelog
+
+### v26.2 (2026-03-02)
+
+* 回滚输出动作字段改动，恢复 Output1/Output6 仅 `topic/payload`，保持链路简单稳定。
+* 重做 Power Gap Boost：加入进入/退出阈值、保持时间、上下坡限速，减少目标温度抖动并提升欠温恢复能力。
+* debug/control 新增 `powerGapKw`、`gapBoostC` 便于现场调参。
 
 ### v26.1 (2026-03-02)
 
