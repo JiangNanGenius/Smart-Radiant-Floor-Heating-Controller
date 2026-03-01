@@ -5,8 +5,8 @@
 
 Smart Radiant Floor Heating Controller (Node-RED)
 
-**版本 / Version**: **v26.3 (FINAL)**
-**最后更新 / Last updated**: 2026-03-02 (Output1 action wrapper)
+**版本 / Version**: **v26.4 (FINAL)**
+**最后更新 / Last updated**: 2026-03-02 (Output1 HA data fix)
 **运行环境 / Runtime**: Node-RED（强烈建议启用 file-based context / localfilesystem）
 **输出 / Outputs**: 8（目标温度显示、阀门开度、WS 同步/恢复、锅炉命令、强制回弹、供水温控器模式、严重报警、分类调试输出）
 **Tick / Timer**: 5 秒
@@ -87,7 +87,7 @@ A production-grade radiant floor heating controller implemented in Node-RED. Eve
     └─ 房间：floorheating_<room>_di_nuan_state/current/target
                    │
                    ▼
-      [Function] 地暖综合控制主代码 v26.3 (每 5 秒)
+      [Function] 地暖综合控制主代码 v26.4 (每 5 秒)
       - enable/disable 判定 + 强制回弹
       - 目标功率 kW 估算
       - 目标混水温度候选 + 平滑
@@ -152,12 +152,12 @@ contextStorage: {
 
 * **topic**: `fh/target_display`
 * **payload.action**: `"climate.set_temperature"`
-* **payload.temperature**: `44`（number，整数 °C）
+* **payload.data.temperature**: `44.0`（number，建议 1 位小数）
 
 示例：
 
 ```json
-{ "topic": "fh/target_display", "payload": { "action": "climate.set_temperature", "temperature": 44 } }
+{ "topic": "fh/target_display", "payload": { "action": "climate.set_temperature", "data": { "temperature": 44.0 } } }
 ```
 
 ### Output2：阀门开度（12-bit）
@@ -717,7 +717,7 @@ A：这是你的“快开+排气”策略。关闭时全开可帮助排气/减�
 **Q2：为什么锅炉命令每 5 秒都发一次？**
 A：为了“反复下发确保可靠”。如果你不想这么频繁，可以在 Output4 下游加一层限频或仅状态变化时下发。
 
-**Q3：为什么 state key 叫 fh_v24_final，但版本是 v26.3？**
+**Q3：为什么 state key 叫 fh_v24_final，但版本是 v26.4？**
 A：这是历史兼容命名。可以改，但要同时改 `RECOVER_CONFIG.STORAGE_KEY` 与所有恢复写回节点。
 
 **Q4：我房间多/少怎么办？**
@@ -731,6 +731,11 @@ A：必须统一。若你是 L/min：
 ---
 
 ## 17. 变更记录 / Changelog
+
+### v26.4 (2026-03-02)
+
+* 修复 Output1 的 HA 调用数据结构：由 `payload.temperature` 改为 `payload.data.temperature`。
+* Output1 温度改为 number 小数（1位），避免 HA 报 `expected float for dictionary value @ data['temperature']`。
 
 ### v26.3 (2026-03-02)
 
