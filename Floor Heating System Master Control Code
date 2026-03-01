@@ -1,9 +1,9 @@
 // ============================================================
-// 地暖综合控制主代码 v26.2 (FINAL + 注释补全版 + PowerGapBoost重构版)
+// 地暖综合控制主代码 v26.3 (FINAL + Output1 Action包装 + PowerGapBoost重构版)
 // timer = 5秒
 // Outputs = 8
 //
-// 1) 目标温度显示（整数，仅前端显示） msg.payload="44"
+// 1) 目标温度输出（Action包装）msg.payload={action:"climate.set_temperature",temperature:44}
 // 2) 阀门开度（1~4095） msg.payload=1920
 // 3) WS同步/恢复：正常=JSON字符串快照；无本地数据=先发"recover"(最多2次)
 // 4) 锅炉地暖命令：msg.payload="heat"/"off"（用于反复下发给锅炉）
@@ -180,7 +180,13 @@ function nowMs() { return Date.now(); }
 
 function buildTargetDisplayMsg(v) {
     const n = Math.round(Number(v) || SYSTEM.MIN_TEMP);
-    return { topic: "fh/target_display", payload: String(n) };
+    return {
+        topic: "fh/target_display",
+        payload: {
+            action: "climate.set_temperature",
+            temperature: n
+        }
+    };
 }
 
 // 锅炉状态短标记（status用，尽量短）
