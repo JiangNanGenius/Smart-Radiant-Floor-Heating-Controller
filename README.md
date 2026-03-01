@@ -5,8 +5,8 @@
 
 Smart Radiant Floor Heating Controller (Node-RED)
 
-**版本 / Version**: **v25.9 (FINAL)**
-**最后更新 / Last updated**: 2026-03-02 (output1 fix)
+**版本 / Version**: **v26.0 (FINAL)**
+**最后更新 / Last updated**: 2026-03-02 (MQTT/action fix)
 **运行环境 / Runtime**: Node-RED（强烈建议启用 file-based context / localfilesystem）
 **输出 / Outputs**: 8（目标温度显示、阀门开度、WS 同步/恢复、锅炉命令、强制回弹、供水温控器模式、严重报警、分类调试输出）
 **Tick / Timer**: 5 秒
@@ -87,7 +87,7 @@ A production-grade radiant floor heating controller implemented in Node-RED. Eve
     └─ 房间：floorheating_<room>_di_nuan_state/current/target
                    │
                    ▼
-      [Function] 地暖综合控制主代码 v25.9 (每 5 秒)
+      [Function] 地暖综合控制主代码 v26.0 (每 5 秒)
       - enable/disable 判定 + 强制回弹
       - 目标功率 kW 估算
       - 目标混水温度候选 + 平滑
@@ -148,12 +148,12 @@ contextStorage: {
 
 > 下面是“主控 Function 每次 tick 的输出数据格式”。你可以据此写 Switch/MQTT/HA action 节点，不会踩坑。
 
-### Output1：目标温度显示（前端展示 + 可直连 HA action）
+### Output1：目标温度显示（前端展示 + HA 提示字段）
 
 * **topic**: `fh/target_display`
 * **payload**: `"44"`（字符串，整数 °C）
-* **action**: `"number.set_value"`
-* **data.value**: `44`（number）
+* **ha_action**: `"number.set_value"`（提示字段，避免占用 `msg.action`）
+* **ha_data.value**: `44`（number）
 
 示例：
 
@@ -161,8 +161,8 @@ contextStorage: {
 {
   "topic": "fh/target_display",
   "payload": "44",
-  "action": "number.set_value",
-  "data": { "value": 44 }
+  "ha_action": "number.set_value",
+  "ha_data": { "value": 44 }
 }
 ```
 
@@ -225,8 +225,8 @@ contextStorage: {
 
 * **topic**: `climate/dinuan/gongshui/mode/set`
 * **payload**: `"heat"` 或 `"off"`
-* **action**: `"climate.set_hvac_mode"`（HA action 节点可直接消费）
-* **data.hvac_mode**: `"heat"` 或 `"off"`
+* **ha_action**: `"climate.set_hvac_mode"`（提示字段）
+* **ha_data.hvac_mode**: `"heat"` 或 `"off"`
 
 示例：
 
@@ -234,8 +234,8 @@ contextStorage: {
 {
   "topic": "climate/dinuan/gongshui/mode/set",
   "payload": "heat",
-  "action": "climate.set_hvac_mode",
-  "data": { "hvac_mode": "heat" }
+  "ha_action": "climate.set_hvac_mode",
+  "ha_data": { "hvac_mode": "heat" }
 }
 ```
 
@@ -670,7 +670,7 @@ return null;
 ### 14.2 供水温控器模式（Output6）
 
 Output6 topic 固定：`climate/dinuan/gongshui/mode/set`
-下游可直接接 HA `call-service`（climate.set_hvac_mode）或 MQTT bridging。
+若下游是 HA action 节点，请先用 Change 节点把 `ha_action -> action`、`ha_data -> data`；这样不会污染 MQTT 节点。
 
 ### 14.3 锅炉命令（Output4）
 
@@ -729,7 +729,7 @@ A：这是你的“快开+排气”策略。关闭时全开可帮助排气/减�
 **Q2：为什么锅炉命令每 5 秒都发一次？**
 A：为了“反复下发确保可靠”。如果你不想这么频繁，可以在 Output4 下游加一层限频或仅状态变化时下发。
 
-**Q3：为什么 state key 叫 fh_v24_final，但版本是 v25.9？**
+**Q3：为什么 state key 叫 fh_v24_final，但版本是 v26.0？**
 A：这是历史兼容命名。可以改，但要同时改 `RECOVER_CONFIG.STORAGE_KEY` 与所有恢复写回节点。
 
 **Q4：我房间多/少怎么办？**
@@ -744,14 +744,19 @@ A：必须统一。若你是 L/min：
 
 ## 17. 变更记录 / Changelog
 
+### v26.0 (2026-03-02)
+
+* 为避免 Node-RED MQTT 节点把 `msg.action` 解析为内部动作而报 `Invalid action specified`，输出中不再使用 `msg.action/msg.data`，改为 `msg.ha_action/msg.ha_data`。
+* Output1/Output6 保留原 `topic/payload`，同时提供 HA 提示字段；需要调用 HA action 时请在下游映射。
+
 ### v25.9 (2026-03-02)
 
-* 修复 Out1（`fh/target_display`）HA action 兼容：增加 `msg.action=number.set_value` 与 `msg.data.value`，避免 action 节点报 `"action" is not allowed to be empty`。
+* 修复 Out1（`fh/target_display`）HA 兼容（该版本历史实现使用 `msg.action/msg.data`，后续 v26.0 已改为 `ha_action/ha_data` 以兼容 MQTT）。
 * Out1 保持原有 `topic/payload`，兼容原前端显示链路。
 
 ### v25.8 (2026-03-02)
 
-* Output6 增加 `msg.action=climate.set_hvac_mode` 与 `msg.data.hvac_mode`，兼容 Home Assistant action 节点，避免出现 `"action" is not allowed to be empty`。
+* Output6 增加 HA 调用提示字段（该版本历史实现使用 `msg.action/msg.data`，后续 v26.0 已改为 `ha_action/ha_data`）。
 * 保持原有 `topic/payload` 不变，兼容既有下游流程。
 
 ### v25.7 (2026-02-26)

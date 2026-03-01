@@ -1,14 +1,14 @@
 // ============================================================
-// 地暖综合控制主代码 v25.9 (FINAL + 注释补全版 + 锅炉状态status + Output1/6 HA action兼容)
+// 地暖综合控制主代码 v26.0 (FINAL + 注释补全版 + 锅炉状态status + MQTT-safe HA hints)
 // timer = 5秒
 // Outputs = 8
 //
-// 1) 目标温度显示（整数）msg.payload="44" + msg.action(number.set_value) + msg.data.value
+// 1) 目标温度显示（整数）msg.payload="44" + msg.ha_action/ha_data（避免占用保留 action）
 // 2) 阀门开度（1~4095） msg.payload=1920
 // 3) WS同步/恢复：正常=JSON字符串快照；无本地数据=先发"recover"(最多2次)
 // 4) 锅炉地暖命令：msg.payload="heat"/"off"（用于反复下发给锅炉）
 // 5) 强制开关回弹：enforce按下后自动关（给 HA action 节点）
-// 6) 物理供水温控器模式：msg.topic + msg.payload(heat/off) + msg.action(climate.set_hvac_mode)
+// 6) 物理供水温控器模式：msg.topic + msg.payload(heat/off) + msg.ha_action/ha_data
 // 7) 严重系统故障报警（微信推送）：msg.title(简要) + msg.payload(详细多行)
 // 8) 调试输出（数组消息，按类别拆分，接 debug 节点）
 //
@@ -177,8 +177,8 @@ function buildTargetDisplayMsg(v) {
     return {
         topic: "fh/target_display",
         payload: String(n),
-        action: "number.set_value",
-        data: { value: n }
+        ha_action: "number.set_value",
+        ha_data: { value: n }
     };
 }
 
@@ -428,7 +428,7 @@ function roomTgt(id) { return clamp(Number(flow.get(`floorheating_${id}_di_nuan_
 function buildSupplyMode(room, forceOff) {
     if (forceOff) {
         flow.set("floor_heating_supply_on", false);
-        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", action: "climate.set_hvac_mode", data: { hvac_mode: "off" }, state: "forced_off" };
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", ha_action: "climate.set_hvac_mode", ha_data: { hvac_mode: "off" }, state: "forced_off" };
     }
 
     let anyHeat = false;
@@ -442,11 +442,11 @@ function buildSupplyMode(room, forceOff) {
 
     if (anyHeat) {
         flow.set("floor_heating_supply_on", true);
-        return { topic: "climate/dinuan/gongshui/mode/set", payload: "heat", action: "climate.set_hvac_mode", data: { hvac_mode: "heat" }, state: "kai" };
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "heat", ha_action: "climate.set_hvac_mode", ha_data: { hvac_mode: "heat" }, state: "kai" };
     }
     if (allOff) {
         flow.set("floor_heating_supply_on", false);
-        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", action: "climate.set_hvac_mode", data: { hvac_mode: "off" }, state: "guan" };
+        return { topic: "climate/dinuan/gongshui/mode/set", payload: "off", ha_action: "climate.set_hvac_mode", ha_data: { hvac_mode: "off" }, state: "guan" };
     }
 
     return null;
@@ -1096,7 +1096,7 @@ try {
         null,
         { payload: "off", topic: "boiler/floorheating" },
         null,
-        { topic: "climate/dinuan/gongshui/mode/set", payload: "off", action: "climate.set_hvac_mode", data: { hvac_mode: "off" } },
+        { topic: "climate/dinuan/gongshui/mode/set", payload: "off", ha_action: "climate.set_hvac_mode", ha_data: { hvac_mode: "off" } },
         crash,
         msg_debug
     ];
