@@ -1,15 +1,16 @@
 // ============================================================
-// 地暖综合控制主代码 v25.5 (FINAL + 注释补全版 + 锅炉状态status)
+// 地暖综合控制主代码 v26.4 (FINAL + Output1 HA数据结构修复 + PowerGapBoost重构版)
 // timer = 5秒
-// Outputs = 7
+// Outputs = 8
 //
-// 1) 目标温度显示（整数，仅前端显示） msg.payload="44"
+// 1) 目标温度输出（HA Action）msg.payload={action:"climate.set_temperature",data:{temperature:44.0}}
 // 2) 阀门开度（1~4095） msg.payload=1920
 // 3) WS同步/恢复：正常=JSON字符串快照；无本地数据=先发"recover"(最多2次)
 // 4) 锅炉地暖命令：msg.payload="heat"/"off"（用于反复下发给锅炉）
 // 5) 强制开关回弹：enforce按下后自动关（给 HA action 节点）
 // 6) 物理供水温控器模式：msg.topic + msg.payload(heat/off)
 // 7) 严重系统故障报警（微信推送）：msg.title(简要) + msg.payload(详细多行)
+// 8) 调试输出（数组消息，按类别拆分，接 debug 节点）
 //
 // 传感器分辨率（已确认）
 // - floorheating_mixedwater_temperature_state : 0.1℃（混水，控制主反馈）
@@ -131,6 +132,18 @@ const SYSTEM = {
     OUTDOOR_ADJ: { REF_C: 5, SLOPE: 0.25 },
     SUN: { REF_LUX: 1000, SLOPE: -1.0 / 50000, MAX: -2.0 },
 
+    POWER_GAP_BOOST: {
+        ENABLED: true,
+        ENTER_GAP_KW: 1.5,
+        EXIT_GAP_KW: 0.8,
+        GAIN_C_PER_KW: 0.7,
+        MAX_C: 4.0,
+        RAMP_UP_C_PER_TICK: 0.25,
+        RAMP_DOWN_C_PER_TICK: 0.15,
+        HOLD_S: 180,
+        UNDERHEAT_OA_FLOOR_C: -0.8
+    },
+
     TANK: {
         HEAT_RATE: 0.18,
         BUFFER_L: 80,
@@ -162,6 +175,20 @@ function isOnLike(v) { return ["on","true","1","heat","enable","opened"].include
 function fmt1(v) { return Number.isFinite(v) ? Number(v).toFixed(1) : "-"; }
 function fmt0(v) { return Number.isFinite(v) ? String(Math.round(Number(v))) : "-"; }
 function nowMs() { return Date.now(); }
+
+
+
+function buildTargetDisplayMsg(v) {
+    const n = Number(v);
+    const t = Number.isFinite(n) ? Number(n.toFixed(1)) : Number(SYSTEM.MIN_TEMP.toFixed(1));
+    return {
+        topic: "fh/target_display",
+        payload: {
+            action: "climate.set_temperature",
+            data: { temperature: t }
+        }
+    };
+}
 
 // 锅炉状态短标记（status用，尽量短）
 // - "--"   不燃烧/未知
@@ -199,12 +226,81 @@ function buildAlarmMsg(code, title, lines) {
     return { title, payload: payloadLines.join("\n"), code };
 }
 
+function buildDebugMsgs(trigger, state, room, enabled, valveSp, T_target_ctrl, msg_alarm, recoverTag) {
+    if (trigger !== "timer") return null;
+
+    const safe = (v, d = null) => Number.isFinite(Number(v)) ? Number(v) : d;
+
+    return [
+        {
+            topic: "fh/debug/system",
+            payload: {
+                enabled: !!enabled,
+                boilerMode: state?.sys?.boilerMode,
+                boilerBurning: !!state?.sys?.boilerBurning,
+                boilerFloorHeating: !!state?.sys?.boilerFloorHeating,
+                recoverTag: recoverTag || "",
+                ts: nowMs()
+            }
+        },
+        {
+            topic: "fh/debug/sensors",
+            payload: {
+                outdoor: safe(state?.thermal?.outdoor),
+                watertank: safe(state?.thermal?.watertank),
+                mixedWaterTemp: safe(state?.sensors?.mixedWaterTemp),
+                outputWaterTemp: safe(state?.sensors?.outputWaterTemp),
+                returnWaterTemp: safe(state?.sensors?.returnWaterTemp),
+                waterFlowM3h: safe(state?.sensors?.waterFlowM3h),
+                sunlight: safe(state?.sensors?.sunlight)
+            }
+        },
+        {
+            topic: "fh/debug/control",
+            payload: {
+                targetDisplay: Math.round(Number(state?.ctrl?.outputRaw) || SYSTEM.MIN_TEMP),
+                targetCtrl: safe(T_target_ctrl, safe(state?.ctrl?.outputRaw, SYSTEM.MIN_TEMP)),
+                targetCandidate: safe(state?.sensors?.targetTempCandidate),
+                targetDeltaT: safe(state?.sensors?.targetDeltaT),
+                heatPowerEmaKw: safe(state?.sensors?.heatPowerEmaKw, 0),
+                heatPowerTargetKw: safe(state?.sensors?.heatPowerTargetKw, 0),
+                powerGapKw: safe((Number(state?.sensors?.heatPowerTargetKw) || 0) - (Number(state?.sensors?.heatPowerEmaKw) || 0), 0),
+                gapBoostC: safe(state?.ctrl?.gapBoostC, 0),
+                valveSetPoint: Number.isFinite(Number(valveSp)) ? Number(valveSp) : Number(state?.valveLast?.set_point) || 4095
+            }
+        },
+        {
+            topic: "fh/debug/power",
+            payload: {
+                heatPowerObsKw: safe(state?.sensors?.heatPowerObsKw, 0),
+                heatPowerEmaKw: safe(state?.sensors?.heatPowerEmaKw, 0),
+                heatPowerTargetKw: safe(state?.sensors?.heatPowerTargetKw, 0),
+                deltaT_supply_return: safe(state?.sensors?.deltaT_supply_return, 0)
+            }
+        },
+        {
+            topic: "fh/debug/rooms",
+            payload: {
+                anyOpen: !!room?.anyOpen,
+                allClosed: !!room?.allClosed,
+                raw: room?.raw || {}
+            }
+        },
+        {
+            topic: "fh/debug/alarm",
+            payload: msg_alarm
+                ? { active: true, title: msg_alarm.title || "", code: msg_alarm.code || "", detail: msg_alarm.payload || "" }
+                : { active: false }
+        }
+    ];
+}
+
 
 // ========================= 默认 state + 合并 =========================
 function defaultState() {
     return {
         sys: { enabled: false, boilerMode: "init", boilerBurning: false, boilerFloorHeating: false },
-        ctrl: { outputRaw: 38.0, lastTargetTs: 0, lastUpdate: nowMs() },
+        ctrl: { outputRaw: 38.0, lastTargetTs: 0, lastUpdate: nowMs(), gapBoostC: 0, gapBoostHoldUntil: 0 },
         thermal: { watertank: 55.0, outdoor: 10.0 },
         sensors: {
             sunlight: 500,
@@ -872,7 +968,7 @@ try {
         state.valveLast.set_point = 4095;
 
         const msg_target_display = (trigger === "timer")
-            ? { payload: String(Math.round(state.ctrl.outputRaw)), topic: "fh/target_display" }
+            ? buildTargetDisplayMsg(state.ctrl.outputRaw)
             : null;
 
         const msg_valve = { payload: 4095, topic: "fh/valve_sp" };
@@ -885,7 +981,9 @@ try {
 
         flow.set(SYSTEM.STORAGE_KEY, state);
 
-        return [msg_target_display, msg_valve, msg_out3, msg_boiler, msg_enforce_reset, msg_supply, null];
+        const msg_debug = buildDebugMsgs(trigger, state, room, enabled, 4095, state.ctrl.outputRaw, null, recoverTag);
+
+        return [msg_target_display, msg_valve, msg_out3, msg_boiler, msg_enforce_reset, msg_supply, null, msg_debug];
     }
 
     // ===================== ON 分支：综合计算 =====================
@@ -902,11 +1000,43 @@ try {
 
     let T_candidate = (Number.isFinite(Tr) ? Tr : 30) + dtNeed;
 
-    T_candidate += outdoorAdj(outdoor);
+    const emaxNow = Number(comfort.emax) || 0;
+    let oa = outdoorAdj(outdoor);
+    if (emaxNow > 0.5 && oa < SYSTEM.POWER_GAP_BOOST.UNDERHEAT_OA_FLOOR_C) {
+        oa = SYSTEM.POWER_GAP_BOOST.UNDERHEAT_OA_FLOOR_C;
+    }
+
+    T_candidate += oa;
     T_candidate += sunAdj(Number(state.sensors.sunlight) || 0);
 
     if (state.sys.boilerMode === "domestic") T_candidate -= 2;
-    if (state.sys.boilerMode === "cooling")  T_candidate -= 1;
+
+    const PemaNow = Number(state.sensors.heatPowerEmaKw) || 0;
+    const powerGapKw = Math.max(0, P_target - PemaNow);
+    let gapBoostNow = Number(state.ctrl.gapBoostC) || 0;
+    let holdUntil = Number(state.ctrl.gapBoostHoldUntil) || 0;
+
+    const pgb = SYSTEM.POWER_GAP_BOOST;
+    const canBoost = pgb.ENABLED && anyOpen && enabled && comfort.emax > 0.2;
+    const enter = (powerGapKw >= pgb.ENTER_GAP_KW);
+    const keep = (now < holdUntil) || (powerGapKw >= pgb.EXIT_GAP_KW);
+
+    let desiredBoost = 0;
+    if (canBoost && (enter || (gapBoostNow > 0 && keep))) {
+        const gapOver = Math.max(0, powerGapKw - pgb.EXIT_GAP_KW);
+        desiredBoost = clamp(gapOver * pgb.GAIN_C_PER_KW, 0, pgb.MAX_C);
+        holdUntil = now + pgb.HOLD_S * 1000;
+    }
+
+    const upStep = pgb.RAMP_UP_C_PER_TICK;
+    const downStep = pgb.RAMP_DOWN_C_PER_TICK;
+    if (desiredBoost > gapBoostNow) gapBoostNow = Math.min(desiredBoost, gapBoostNow + upStep);
+    else gapBoostNow = Math.max(desiredBoost, gapBoostNow - downStep);
+
+    gapBoostNow = clamp(gapBoostNow, 0, pgb.MAX_C);
+    state.ctrl.gapBoostC = gapBoostNow;
+    state.ctrl.gapBoostHoldUntil = holdUntil;
+    T_candidate += gapBoostNow;
 
     T_candidate = Math.max(T_candidate, outdoorResetMin(outdoor));
 
@@ -920,7 +1050,7 @@ try {
     updateTankModel(state, now);
 
     const T_target_display = Math.round(state.ctrl.outputRaw);
-    const msg_target_display = { payload: String(T_target_display), topic: "fh/target_display" };
+    const msg_target_display = buildTargetDisplayMsg(T_target_display);
 
     const T_target_ctrl = Math.round(state.ctrl.outputRaw * 10) / 10;
 
@@ -968,7 +1098,9 @@ try {
 
     flow.set(SYSTEM.STORAGE_KEY, state);
 
-    return [msg_target_display, msg_valve, msg_out3, msg_boiler, msg_enforce_reset, msg_supply, msg_alarm];
+    const msg_debug = buildDebugMsgs(trigger, state, room, enabled, valveSp, T_target_ctrl, msg_alarm, recoverTag);
+
+    return [msg_target_display, msg_valve, msg_out3, msg_boiler, msg_enforce_reset, msg_supply, msg_alarm, msg_debug];
 
 } catch (e) {
     node.error(`[FATAL] ${e.message}`);
@@ -985,13 +1117,18 @@ try {
 
     node.status({ fill: "red", shape: "ring", text: "❌ERR|🧩4095" });
 
+    const fallbackState = mergeState(flow.get(SYSTEM.STORAGE_KEY));
+    const fallbackRoom = readRoomModes();
+    const msg_debug = buildDebugMsgs("timer", fallbackState, fallbackRoom, false, 4095, SYSTEM.MIN_TEMP, crash, "");
+
     return [
-        { payload: String(SYSTEM.MIN_TEMP), topic: "fh/target_display" },
+        buildTargetDisplayMsg(SYSTEM.MIN_TEMP),
         { payload: 4095, topic: "fh/valve_sp" },
         null,
         { payload: "off", topic: "boiler/floorheating" },
         null,
         { topic: "climate/dinuan/gongshui/mode/set", payload: "off" },
-        crash
+        crash,
+        msg_debug
     ];
 }

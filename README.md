@@ -5,10 +5,10 @@
 
 Smart Radiant Floor Heating Controller (Node-RED)
 
-**版本 / Version**: **v25.5 (FINAL)**
-**最后更新 / Last updated**: 2026-01-04
+**版本 / Version**: **v26.4 (FINAL)**
+**最后更新 / Last updated**: 2026-03-02 (Output1 HA data fix)
 **运行环境 / Runtime**: Node-RED（强烈建议启用 file-based context / localfilesystem）
-**输出 / Outputs**: 7（目标温度显示、阀门开度、WS 同步/恢复、锅炉命令、强制回弹、供水温控器模式、严重报警）
+**输出 / Outputs**: 8（目标温度显示、阀门开度、WS 同步/恢复、锅炉命令、强制回弹、供水温控器模式、严重报警、分类调试输出）
 **Tick / Timer**: 5 秒
 
 ---
@@ -19,7 +19,7 @@ Smart Radiant Floor Heating Controller (Node-RED)
 * [2. 主要特性 / Features](#2-主要特性--features)
 * [3. 系统架构 / System Architecture](#3-系统架构--system-architecture)
 * [4. 快速开始 / Quick Start](#4-快速开始--quick-start)
-* [5. 消息契约（7 路输出）/ Message Contract (7 Outputs)](#5-消息契约7-路输出-message-contract-7-outputs)
+* [5. 消息契约（8 路输出）/ Message Contract (8 Outputs)](#5-消息契约8-路输出-message-contract-8-outputs)
 * [6. 上下文键与传感器分辨率 / Context Keys & Sensor Resolution](#6-上下文键与传感器分辨率--context-keys--sensor-resolution)
 * [7. 启停逻辑 / Enable-Disable Logic](#7-启停逻辑--enable-disable-logic)
 * [8. 算法详解 / Algorithms Deep Dive](#8-算法详解--algorithms-deep-dive)
@@ -58,7 +58,7 @@ A production-grade radiant floor heating controller implemented in Node-RED. Eve
 
 ## 2. 主要特性 / Features
 
-* ✅ **单 Function 一体化**：启停、目标温度、阀门、锅炉命令、供水模式、恢复、报警全部集成（7 Outputs）。
+* ✅ **单 Function 一体化**：启停、目标温度、阀门、锅炉命令、供水模式、恢复、报警全部集成（8 Outputs）。
 * ✅ **工程型阀门控制 V2**：
 
   * 前馈比例（基于水箱与回水解混合比例）
@@ -87,7 +87,7 @@ A production-grade radiant floor heating controller implemented in Node-RED. Eve
     └─ 房间：floorheating_<room>_di_nuan_state/current/target
                    │
                    ▼
-      [Function] 地暖综合控制主代码 v25.5 (每 5 秒)
+      [Function] 地暖综合控制主代码 v26.4 (每 5 秒)
       - enable/disable 判定 + 强制回弹
       - 目标功率 kW 估算
       - 目标混水温度候选 + 平滑
@@ -101,7 +101,8 @@ A production-grade radiant floor heating controller implemented in Node-RED. Eve
                    ├─ Output4 锅炉 heat/off
                    ├─ Output5 enforce 回弹 off
                    ├─ Output6 供水温控器模式 heat/off
-                   └─ Output7 微信报警 title + 多行 payload
+                   ├─ Output7 微信报警 title + 多行 payload
+                   └─ Output8 分类调试输出（数组，按 topic 分类）
 ```
 
 ---
@@ -128,7 +129,7 @@ contextStorage: {
 
 1. **Inject 定时器（5 秒）** → 触发主控 Function
 2. **上游采集写 flow**：把传感器、房间状态写入 `flow.set(...)`
-3. **下游执行**：消费 7 路输出（阀门、锅炉、供水模式、WS、报警等）
+3. **下游执行**：消费 8 路输出（阀门、锅炉、供水模式、WS、报警等）
 
 ### 4.3 运行前检查清单
 
@@ -143,19 +144,20 @@ contextStorage: {
 
 ---
 
-## 5. 消息契约（7 路输出）/ Message Contract (7 Outputs)
+## 5. 消息契约（8 路输出）/ Message Contract (8 Outputs)
 
 > 下面是“主控 Function 每次 tick 的输出数据格式”。你可以据此写 Switch/MQTT/HA action 节点，不会踩坑。
 
-### Output1：目标温度显示（仅前端展示）
+### Output1：目标温度调控（Action 包装）
 
 * **topic**: `fh/target_display`
-* **payload**: `"44"`（字符串，整数 °C）
+* **payload.action**: `"climate.set_temperature"`
+* **payload.data.temperature**: `44.0`（number，建议 1 位小数）
 
 示例：
 
 ```json
-{ "topic": "fh/target_display", "payload": "44" }
+{ "topic": "fh/target_display", "payload": { "action": "climate.set_temperature", "data": { "temperature": 44.0 } } }
 ```
 
 ### Output2：阀门开度（12-bit）
@@ -218,6 +220,7 @@ contextStorage: {
 * **topic**: `climate/dinuan/gongshui/mode/set`
 * **payload**: `"heat"` 或 `"off"`
 
+
 示例：
 
 ```json
@@ -236,6 +239,33 @@ contextStorage: {
 {
   "title": "地暖流量异常",
   "payload": "现象：地暖已开启且需要升温，但流量持续接近 0（严重）\n当前：目标45.0℃ 混水38.2℃ 水箱55.1℃ 流量0.00m³/h 阀门3000\n建议：检查循环泵/过滤器/排气/阀门/流量计"
+}
+```
+
+### Output8：分类调试输出（给 debug 节点）
+
+* **payload**: 数组（每项都是一条消息对象）
+* 每项消息按 `topic` 分类，包含：
+
+  * `fh/debug/system`
+  * `fh/debug/sensors`
+  * `fh/debug/control`
+  * `fh/debug/power`
+  * `fh/debug/rooms`
+  * `fh/debug/alarm`
+
+示例（Output8 payload 内的一项）：
+
+```json
+{
+  "topic": "fh/debug/control",
+  "payload": {
+    "targetDisplay": 44,
+    "targetCtrl": 43.8,
+    "targetCandidate": 44.1,
+    "targetDeltaT": 6.2,
+    "valveSetPoint": 1920
+  }
 }
 ```
 
@@ -687,7 +717,7 @@ A：这是你的“快开+排气”策略。关闭时全开可帮助排气/减�
 **Q2：为什么锅炉命令每 5 秒都发一次？**
 A：为了“反复下发确保可靠”。如果你不想这么频繁，可以在 Output4 下游加一层限频或仅状态变化时下发。
 
-**Q3：为什么 state key 叫 fh_v24_final，但版本是 v25.5？**
+**Q3：为什么 state key 叫 fh_v24_final，但版本是 v26.4？**
 A：这是历史兼容命名。可以改，但要同时改 `RECOVER_CONFIG.STORAGE_KEY` 与所有恢复写回节点。
 
 **Q4：我房间多/少怎么办？**
@@ -701,6 +731,53 @@ A：必须统一。若你是 L/min：
 ---
 
 ## 17. 变更记录 / Changelog
+
+### v26.4 (2026-03-02)
+
+* 修复 Output1 的 HA 调用数据结构：由 `payload.temperature` 改为 `payload.data.temperature`。
+* Output1 温度改为 number 小数（1位），避免 HA 报 `expected float for dictionary value @ data['temperature']`。
+
+### v26.3 (2026-03-02)
+
+* 修复 Output1：按 action 节点需求输出 `msg.payload={ action, temperature }`，避免继续出现 `"action" is not allowed to be empty`。
+* 其余控制逻辑保持不变。
+
+### v26.2 (2026-03-02)
+
+* 回滚输出动作字段改动，恢复 Output1/Output6 仅 `topic/payload`，保持链路简单稳定。
+* 重做 Power Gap Boost：加入进入/退出阈值、保持时间、上下坡限速，减少目标温度抖动并提升欠温恢复能力。
+* debug/control 新增 `powerGapKw`、`gapBoostC` 便于现场调参。
+
+### v26.1 (2026-03-02)
+
+* 新增输出动作模式开关：`flow.fh_output_action_mode`。默认 `ha`（输出 `action/data` + `ha_action/ha_data`），可切换 `mqtt_safe`（仅 `ha_action/ha_data`）。
+* 修复当前现场报错 `"action" is not allowed to be empty`：默认模式可直接满足 HA action 节点。
+
+### v26.0 (2026-03-02)
+
+* 为避免 Node-RED MQTT 节点把 `msg.action` 解析为内部动作而报 `Invalid action specified`，输出中不再使用 `msg.action/msg.data`，改为 `msg.ha_action/msg.ha_data`。
+* Output1/Output6 保留原 `topic/payload`，同时提供 HA 提示字段；需要调用 HA action 时请在下游映射。
+
+### v25.9 (2026-03-02)
+
+* 修复 Out1（`fh/target_display`）HA 兼容（该版本历史实现使用 `msg.action/msg.data`，后续 v26.0 已改为 `ha_action/ha_data` 以兼容 MQTT）。
+* Out1 保持原有 `topic/payload`，兼容原前端显示链路。
+
+### v25.8 (2026-03-02)
+
+* Output6 增加 HA 调用提示字段（该版本历史实现使用 `msg.action/msg.data`，后续 v26.0 已改为 `ha_action/ha_data`）。
+* 保持原有 `topic/payload` 不变，兼容既有下游流程。
+
+### v25.7 (2026-02-26)
+
+* 新增“功率缺口升温补偿”（Power Gap Boost）：当目标功率明显高于实测功率时，自动提高目标水温，缓解房间升温慢。
+* 欠温时限制户外负向修正的下限，避免目标温度被户外补偿压得过低。
+* debug/control 增加功率目标与实测字段，便于调参。
+
+### v25.6 (2026-02-26)
+
+* 输出口从 7 路升级为 8 路，新增 Output8 分类调试输出（system/sensors/control/power/rooms/alarm）。
+* 主代码版本号同步升级到 v25.6。
 
 ### v25.5 (FINAL)
 
